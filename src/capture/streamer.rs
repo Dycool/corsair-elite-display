@@ -16,7 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject, SetStretchBltMode, StretchBlt,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, ICONINFO,
@@ -458,7 +458,10 @@ fn stream_loop(
     stats: Arc<Mutex<StreamStats>>,
 ) {
     unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        // The panel only presents 30 frames per second. Keeping the capture
+        // worker at high priority and avoiding timer oversleep helps each
+        // frame reach that presentation slot as soon as possible.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
     let mut capture = match GdiCapture::new() {
         Ok(capture) => capture,
@@ -585,7 +588,18 @@ fn stream_loop(
         next_frame += target;
         let now = Instant::now();
         if next_frame > now {
-            thread::sleep(next_frame - now);
+            // Windows' normal sleep cadence can overshoot by several
+            // milliseconds. Sleep for most of the interval, then yield/spin
+            // only for the final millisecond to keep latency and jitter low
+            // without continuously consuming a CPU core.
+            let remaining = next_frame - now;
+            let spin_window = Duration::from_millis(1);
+            if remaining > spin_window {
+                thread::sleep(remaining - spin_window);
+            }
+            while Instant::now() < next_frame {
+                std::hint::spin_loop();
+            }
         } else {
             next_frame = now;
         }

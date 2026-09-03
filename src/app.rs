@@ -237,11 +237,7 @@ impl AppState {
             append_checked(
                 menu,
                 MENU_TOGGLE,
-                if self.settings.streaming {
-                    "Turn second screen off"
-                } else {
-                    "Turn second screen on"
-                },
+                if self.settings.streaming { "On" } else { "Off" },
                 self.settings.streaming,
             );
             append_checked(
