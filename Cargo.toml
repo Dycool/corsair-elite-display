@@ -1,0 +1,18 @@
+[package]
+name = "corsair-elite-display"
+version = "0.1.0"
+edition = "2024"
+authors = ["Diogo"]
+description = "Use Corsair H100i Elite LCD cooler as a real second display in Windows"
+
+[dependencies]
+eframe = "0.36"
+xcap = "0.9.8"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
