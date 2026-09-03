@@ -234,7 +234,16 @@ impl AppState {
                 return;
             }
 
-            append_checked(menu, MENU_TOGGLE, "Second screen", self.settings.streaming);
+            append_checked(
+                menu,
+                MENU_TOGGLE,
+                if self.settings.streaming {
+                    "Turn second screen off"
+                } else {
+                    "Turn second screen on"
+                },
+                self.settings.streaming,
+            );
             append_checked(
                 menu,
                 MENU_SHOW_MOUSE,

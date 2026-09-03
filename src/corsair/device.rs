@@ -171,29 +171,45 @@ impl CorsairLcdDevice {
 
             let packet = frame_packet(chunk, part_num, is_end != 0);
 
-            unsafe {
-                let mut written = 0u32;
-                let success = WriteFile(
-                    self.handle,
-                    packet.as_ptr(),
-                    packet.len() as u32,
-                    &mut written,
-                    null_mut(),
-                );
-                if success == 0 || written != packet.len() as u32 {
-                    let err = GetLastError();
-                    return Err(format!("WriteFile failed with error {}", err));
-                }
-            }
+            self.write_packet(&packet)?;
         }
 
+        Ok(())
+    }
+
+    fn write_packet(&self, packet: &[u8]) -> Result<(), String> {
+        unsafe {
+            let mut written = 0u32;
+            let success = WriteFile(
+                self.handle,
+                packet.as_ptr(),
+                packet.len() as u32,
+                &mut written,
+                null_mut(),
+            );
+            if success == 0 || written != packet.len() as u32 {
+                return Err(format!("WriteFile failed with error {}", GetLastError()));
+            }
+        }
         Ok(())
     }
 
     /// Stops software ownership of the LCD. The cap firmware resumes its saved
     /// hardware screen as soon as the HID handle is released.
     pub fn release_to_hardware(self) {
+        // Tell the controller to leave software control before closing the HID
+        // handle. Relying on the firmware timeout alone can leave the last
+        // streamed frame on the LCD for tens of seconds.
+        let mut command = [0u8; 1024];
+        command[..4].copy_from_slice(&[0x01, 0x03, 0x00, 0x01]);
+        let _ = self.write_packet(&command);
         drop(self);
+    }
+
+    pub fn restore_hardware_now() {
+        if let Ok(device) = Self::open() {
+            device.release_to_hardware();
+        }
     }
 }
 

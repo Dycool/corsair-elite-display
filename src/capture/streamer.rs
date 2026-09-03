@@ -410,6 +410,11 @@ impl StreamController {
 
     pub fn set_running(&self, running: bool) {
         let changed = self.running.swap(running, Ordering::AcqRel) != running;
+        if changed && !running {
+            // Do not wait for the worker's next capture/write cycle: release
+            // software mode from this control path immediately.
+            CorsairLcdDevice::restore_hardware_now();
+        }
         if changed && let Ok(mut current) = self.stats.lock() {
             current.fps = 0.0;
             current.latency_ms = 0.0;
