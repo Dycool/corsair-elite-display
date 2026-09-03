@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, c_void};
+use std::ffi::{c_void, OsStr};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
@@ -10,17 +10,17 @@ use std::time::{Duration, Instant};
 use image::ExtendedColorType;
 use windows_sys::Win32::Foundation::{GetLastError, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, COLORONCOLOR, CreateCompatibleDC, CreateDCW,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-    GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, BitBlt, PatBlt, ReleaseDC, SRCCOPY,
-    SelectObject, SetStretchBltMode, StretchBlt,
+    BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetMonitorInfoW, PatBlt, ReleaseDC, SelectObject,
+    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACKNESS,
+    COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, SRCCOPY,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, ICONINFO,
-    MONITORINFOF_PRIMARY,
+    DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
+    ICONINFO, MONITORINFOF_PRIMARY,
 };
 
 use crate::corsair::CorsairLcdDevice;
@@ -196,6 +196,16 @@ impl GdiCapture {
         }
     }
 
+    pub fn reset_source(&mut self) {
+        unsafe {
+            if !self.source_dc.is_null() {
+                DeleteDC(self.source_dc);
+                self.source_dc = null_mut();
+            }
+        }
+        self.source_name.clear();
+    }
+
     fn capture(
         &mut self,
         monitor: &MonitorInfo,
@@ -210,10 +220,11 @@ impl GdiCapture {
             return Err("The selected display has no active surface".into());
         }
 
-        if self.source_name != monitor.device_name {
+        if self.source_dc.is_null() || self.source_name != monitor.device_name {
             unsafe {
                 if !self.source_dc.is_null() {
                     DeleteDC(self.source_dc);
+                    self.source_dc = null_mut();
                 }
                 let driver: Vec<u16> = OsStr::new("DISPLAY").encode_wide().chain(Some(0)).collect();
                 let device: Vec<u16> = OsStr::new(&monitor.device_name)
@@ -256,6 +267,7 @@ impl GdiCapture {
                     SRCCOPY,
                 ) == 0
                 {
+                    self.reset_source();
                     return Err(format!(
                         "Windows screen capture failed (error {})",
                         GetLastError()
@@ -278,6 +290,7 @@ impl GdiCapture {
                     SRCCOPY,
                 ) == 0
                 {
+                    self.reset_source();
                     return Err(format!(
                         "Windows screen capture failed (error {})",
                         GetLastError()
@@ -468,7 +481,7 @@ impl Default for StreamStats {
             frame_count: 0,
             frame_bytes: 0,
             latency_ms: 0.0,
-            status: "Starting…".into(),
+            status: "Starting...".into(),
         }
     }
 }
@@ -512,19 +525,14 @@ impl StreamController {
 
     pub fn set_running(&self, running: bool) {
         let changed = self.running.swap(running, Ordering::AcqRel) != running;
-        if changed && !running {
-            // Do not wait for the worker's next capture/write cycle: release
-            // software mode from this control path immediately.
-            CorsairLcdDevice::restore_hardware_now();
-        }
         if changed && let Ok(mut current) = self.stats.lock() {
             current.fps = 0.0;
             current.latency_ms = 0.0;
             current.frame_bytes = 0;
             current.status = if running {
-                "Preparing the 480×480 second screen…".into()
+                "Preparing the 480x480 second screen...".into()
             } else {
-                "Off · cooler hardware screen active".into()
+                "Off".into()
             };
         }
     }
@@ -560,7 +568,7 @@ fn stream_loop(
     stats: Arc<Mutex<StreamStats>>,
 ) {
     unsafe {
-        // The Corsair LCD panel has a physical refresh limit of 30 Hz.
+        // Physical presentation limit of the Corsair LCD panel is 30 Hz.
         // Keeping the capture worker at high priority avoids timer jitter
         // and delivers sampled frames directly to the hardware presentation slot.
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -585,24 +593,45 @@ fn stream_loop(
     let mut last_sent = Instant::now() - Duration::from_secs(10);
     let mut last_config = Settings::default();
     let mut next_frame = Instant::now();
+    let mut was_running = running.load(Ordering::Acquire);
+    let mut force_fresh_frames = 30u32;
 
     while !shutdown.load(Ordering::Acquire) {
-        if !running.load(Ordering::Acquire) {
+        let is_running = running.load(Ordering::Acquire);
+
+        // Detect transitions between Off and On
+        if is_running != was_running {
+            was_running = is_running;
+            capture.reset_source();
+            prev_pixels.clear();
+            if is_running {
+                force_fresh_frames = 30;
+                set_status(&stats, "Resuming second screen...");
+            }
+        }
+
+        if !is_running {
             if let Some(connected) = device.take() {
                 connected.release_to_hardware();
             }
+            capture.reset_source();
             prev_pixels.clear();
-            set_status(&stats, "Off – hardware screen restored");
+            set_status(&stats, "Off");
             next_frame = Instant::now();
             thread::sleep(Duration::from_millis(50));
             continue;
         }
 
+        let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
+
         if device.is_none() && Instant::now() >= next_connect {
             match CorsairLcdDevice::open() {
                 Ok(found) => {
+                    let _ = found.set_brightness(config.brightness);
                     device = Some(found);
                     prev_pixels.clear();
+                    capture.reset_source();
+                    force_fresh_frames = 30;
                 }
                 Err(error) => {
                     set_status(&stats, error);
@@ -616,9 +645,13 @@ fn stream_loop(
         }
 
         let frame_started = Instant::now();
-        let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
 
         // If rendering parameters changed, invalidate cached frame so update displays immediately
+        if config.brightness != last_config.brightness {
+            if let Some(dev) = device.as_ref() {
+                let _ = dev.set_brightness(config.brightness);
+            }
+        }
         if config.brightness != last_config.brightness
             || config.rotation != last_config.rotation
             || config.view_mode != last_config.view_mode
@@ -653,7 +686,8 @@ fn stream_loop(
             });
         let Some(monitor) = selected else {
             prev_pixels.clear();
-            set_status(&stats, "Preparing the 480x480 second screen…");
+            capture.reset_source();
+            set_status(&stats, "Preparing the 480x480 second screen...");
             thread::sleep(Duration::from_millis(250));
             continue;
         };
@@ -669,8 +703,13 @@ fn stream_loop(
 
         let result: Result<Option<usize>, String> = (|| {
             let pixels = captured?;
-            let is_dirty = prev_pixels.is_empty() || prev_pixels.as_slice() != pixels;
-            // Keepalive: send at least one frame per second so cooler firmware doesn't time out to hardware mode
+            let is_dirty = prev_pixels.is_empty()
+                || force_fresh_frames > 0
+                || prev_pixels.as_slice() != pixels;
+            if force_fresh_frames > 0 {
+                force_fresh_frames -= 1;
+            }
+            // Keepalive: send at least one frame per second so cooler firmware doesn't time out
             let keepalive_due = last_sent.elapsed() >= Duration::from_millis(1000);
 
             if is_dirty || keepalive_due {
@@ -710,8 +749,7 @@ fn stream_loop(
                 Ok(Some(bytes))
             } else {
                 // Frame is identical to previous: skip encoding and USB write.
-                // This keeps the cooler microcontroller idle with zero queued packets,
-                // so when new content or mouse motion arrives, it renders with zero delay!
+                // Keeps microcontroller idle with zero queued packets for instant response.
                 Ok(None)
             }
         })();
@@ -757,10 +795,13 @@ fn stream_loop(
                 }
             }
             Err(error) => {
-                set_status(&stats, error);
-                device = None;
+                set_status(&stats, &error);
+                capture.reset_source();
                 prev_pixels.clear();
-                next_connect = Instant::now() + Duration::from_secs(1);
+                if error.contains("WriteFile") || error.contains("device") {
+                    device = None;
+                    next_connect = Instant::now() + Duration::from_secs(1);
+                }
             }
         }
 
@@ -769,8 +810,6 @@ fn stream_loop(
         let target = Duration::from_secs_f64(1.0 / effective_fps as f64);
         let now = Instant::now();
         if now >= next_frame {
-            // If processing or USB transfer took longer than expected, do NOT run back-to-back.
-            // Reset next_frame to give the microcontroller its full interval to complete scanout.
             next_frame = now + target;
         } else {
             let remaining = next_frame - now;

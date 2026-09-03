@@ -2,6 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::ptr::null_mut;
 
+use image::ExtendedColorType;
+
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
@@ -55,6 +57,15 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
 }
 
+#[link(name = "hid")]
+unsafe extern "system" {
+    fn HidD_SetFeature(
+        HidDeviceObject: *mut std::ffi::c_void,
+        ReportBuffer: *const u8,
+        ReportBufferLength: u32,
+    ) -> u8;
+}
+
 fn to_u16_vec(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
@@ -79,6 +90,9 @@ fn frame_packet(chunk: &[u8], part_num: u16, is_end: bool) -> [u8; 1024] {
 pub struct CorsairLcdDevice {
     handle: *mut std::ffi::c_void,
 }
+
+unsafe impl Send for CorsairLcdDevice {}
+unsafe impl Sync for CorsairLcdDevice {}
 
 impl CorsairLcdDevice {
     fn find_device_paths() -> Vec<String> {
@@ -132,7 +146,7 @@ impl CorsairLcdDevice {
     pub fn open() -> Result<Self, String> {
         let paths = Self::find_device_paths();
         if paths.is_empty() {
-            return Err("Waiting for a supported Corsair LCD…".to_string());
+            return Err("Waiting for a supported Corsair LCD...".to_string());
         }
         let mut last_error = 0;
         for path in paths {
@@ -156,6 +170,46 @@ impl CorsairLcdDevice {
         Err(format!(
             "Corsair LCD found but unavailable (Windows error {last_error}). Close iCUE if it is using the screen."
         ))
+    }
+
+    pub fn set_brightness(&self, percent: u8) -> Result<(), String> {
+        let raw_val = match percent {
+            0 => 0x00,
+            1..=16 => 0x01,
+            17..=49 => 0x04,
+            50..=83 => 0x10,
+            _ => 0x40,
+        };
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x0B; // Opcode: LCD Brightness
+        packet[2] = raw_val;
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (brightness) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_screen(&self) -> Result<(), String> {
+        let black_pixels = vec![0u8; 480 * 480 * 3];
+        let mut jpeg = Vec::with_capacity(8 * 1024);
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 60)
+            .encode(
+                &black_pixels,
+                480,
+                480,
+                ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| format!("JPEG blank frame encoding failed: {e}"))?;
+        self.send_frame(&jpeg)
+    }
+
+    pub fn turn_off(&self) {
+        let _ = self.clear_screen();
+        let _ = self.set_brightness(0);
     }
 
     pub fn send_frame(&self, jpeg_data: &[u8]) -> Result<(), String> {
@@ -201,22 +255,11 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    /// Stops software ownership of the LCD. The cap firmware resumes its saved
-    /// hardware screen as soon as the HID handle is released.
+    /// Stops software ownership of the LCD. Clears any residual frame and shuts
+    /// down backlight power before closing the HID handle.
     pub fn release_to_hardware(self) {
-        // Tell the controller to leave software control before closing the HID
-        // handle. Relying on the firmware timeout alone can leave the last
-        // streamed frame on the LCD for tens of seconds.
-        let mut command = [0u8; 1024];
-        command[..4].copy_from_slice(&[0x01, 0x03, 0x00, 0x01]);
-        let _ = self.write_packet(&command);
+        self.turn_off();
         drop(self);
-    }
-
-    pub fn restore_hardware_now() {
-        if let Ok(device) = Self::open() {
-            device.release_to_hardware();
-        }
     }
 }
 

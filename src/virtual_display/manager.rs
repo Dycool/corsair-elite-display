@@ -58,6 +58,8 @@ impl VirtualDisplayManager {
         display_switch("/extend")?;
         for _ in 0..30 {
             if monitor_attached() {
+                // Allow Windows DWM a moment to compose the desktop plane on the re-attached display
+                thread::sleep(Duration::from_millis(200));
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
