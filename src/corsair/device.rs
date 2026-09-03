@@ -223,8 +223,6 @@ impl CorsairLcdDevice {
                     handle,
                     product_name,
                 };
-                // Switch to software streaming mode
-                let _ = device.set_hardware_mode(false);
                 return Ok(device);
             }
             last_error = unsafe { GetLastError() };
@@ -237,33 +235,6 @@ impl CorsairLcdDevice {
     #[allow(dead_code)]
     pub fn product_name(&self) -> &str {
         &self.product_name
-    }
-
-    pub fn set_hardware_mode(&self, enabled: bool) -> Result<(), String> {
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x1B; // Opcode: Set Hardware Mode
-        packet[2] = if enabled { 0x01 } else { 0x00 };
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (set_hardware_mode) failed: {}", GetLastError()));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn enter_hardware_mode(&self) -> Result<(), String> {
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x1E; // Opcode: Enter Hardware Mode
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (enter_hardware_mode) failed: {}", GetLastError()));
-            }
-        }
-        Ok(())
     }
 
     pub fn set_brightness(&self, percent: u8) -> Result<(), String> {
@@ -353,14 +324,10 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    /// Releases software ownership of the LCD and commands the device
-    /// to resume its hardware configuration (image / GIF / sensor screen).
-    pub fn release_to_hardware(self, active_brightness: u8) {
-        // Restore operating brightness so the hardware screen is clearly visible
-        let _ = self.set_brightness(active_brightness.max(50));
-        // Tell the microcontroller to transition to hardware mode
-        let _ = self.set_hardware_mode(true);
-        let _ = self.enter_hardware_mode();
+    /// Releases software ownership of the LCD.
+    /// The cooler microcontroller resumes its saved hardware screen as soon as the handle is closed.
+    /// We do NOT send any reset or clear opcodes, ensuring the onboard hardware image remains intact.
+    pub fn release_to_hardware(self) {
         drop(self);
     }
 }

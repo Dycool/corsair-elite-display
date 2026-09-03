@@ -25,7 +25,6 @@ const MENU_TOGGLE: usize = 200;
 const MENU_STARTUP: usize = 201;
 const MENU_EXIT: usize = 202;
 const MENU_SHOW_MOUSE: usize = 203;
-const MENU_CONFIGURE_VDD: usize = 204;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
@@ -88,12 +87,58 @@ impl AppState {
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
-        let _ = VirtualDisplayManager::ensure_configured();
-        if !VirtualDisplayManager::is_driver_installed() && !VirtualDisplayManager::is_admin() {
-            let msg = wide("Corsair Elite Display requires Administrator privileges to set up the Virtual Screen driver for the first time.\n\nPlease close this instance and run the application as Administrator.");
-            let title = wide("Administrator Privileges Required");
-            unsafe {
-                MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+        // Check if virtual screen driver & configuration are ready on boot
+        if !VirtualDisplayManager::is_ready() {
+            if !VirtualDisplayManager::is_admin() {
+                let msg = wide(
+                    "Corsair Elite Display requires Administrator privileges to set up the Virtual Screen driver for the first time.\n\nWould you like to grant Administrator privileges now?"
+                );
+                let title = wide("Corsair Elite Display - Setup");
+                let response = unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        msg.as_ptr(),
+                        title.as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION,
+                    )
+                };
+                if response == IDYES {
+                    let mut exe_path = [0u16; 1024];
+                    let len = unsafe {
+                        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+                            null_mut(),
+                            exe_path.as_mut_ptr(),
+                            exe_path.len() as u32,
+                        )
+                    };
+                    if len > 0 {
+                        unsafe {
+                            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                                null_mut(),
+                                wide("runas").as_ptr(),
+                                exe_path.as_ptr(),
+                                null(),
+                                null(),
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                        std::process::exit(0);
+                    }
+                } else {
+                    let cancel_msg = wide(
+                        "Virtual Screen setup was skipped.\n\nPlease run Corsair Elite Display as Administrator to enable the cooler display."
+                    );
+                    unsafe {
+                        MessageBoxW(hwnd, cancel_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    }
+                    self.settings.streaming = false;
+                    self.save();
+                }
+            } else {
+                // Running as Administrator: install driver, write config, and restart virtual display
+                if let Err(error) = VirtualDisplayManager::configure_and_restart() {
+                    show_error(hwnd, &format!("Virtual Screen configuration error:\n{error}"));
+                }
             }
         }
 
@@ -139,7 +184,7 @@ impl AppState {
             VirtualDisplayManager::deactivate();
             self.save();
         } else if let Err(error) = VirtualDisplayManager::activate() {
-            if !VirtualDisplayManager::is_admin() && !VirtualDisplayManager::is_driver_installed() {
+            if !VirtualDisplayManager::is_admin() && !VirtualDisplayManager::is_ready() {
                 let msg = wide("Administrator privileges are required to install and configure the Virtual Screen driver.\n\nPlease run Corsair Elite Display as Administrator.");
                 let title = wide("Administrator Privileges Required");
                 unsafe {
@@ -321,7 +366,6 @@ impl AppState {
             append_submenu(menu, view, "View");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_checked(menu, MENU_STARTUP, "Start with Windows", startup_enabled());
-            append_menu(menu, MENU_CONFIGURE_VDD, "Configure Virtual Screen...");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_menu(menu, MENU_EXIT, "Exit");
 
@@ -349,24 +393,6 @@ impl AppState {
                 MENU_STARTUP => {
                     if let Err(error) = set_startup(!startup_enabled()) {
                         show_error(self.hwnd, &error);
-                    }
-                }
-                MENU_CONFIGURE_VDD => {
-                    if !VirtualDisplayManager::is_admin() {
-                        let msg = wide("Administrator privileges are required to configure and install the Virtual Screen driver.\n\nPlease close Corsair Elite Display, right-click the application, and select 'Run as administrator'.");
-                        let title = wide("Administrator Privileges Required");
-                        MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
-                    } else {
-                        match VirtualDisplayManager::configure_and_restart() {
-                            Ok(()) => {
-                                let msg = wide("The Corsair LCD Virtual Screen has been successfully configured and activated!\n\nWindows will now identify the display as 'Corsair LCD'.");
-                                let title = wide("Virtual Screen Configured");
-                                MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                            }
-                            Err(e) => {
-                                show_error(self.hwnd, &e);
-                            }
-                        }
                     }
                 }
                 MENU_EXIT => {

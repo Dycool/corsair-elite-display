@@ -614,8 +614,7 @@ fn stream_loop(
 
         if !is_running {
             if let Some(connected) = device.take() {
-                let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
-                connected.release_to_hardware(config.brightness);
+                connected.release_to_hardware();
             }
             capture.reset_source();
             prev_pixels.clear();
@@ -828,7 +827,6 @@ fn stream_loop(
     }
 
     if let Some(connected) = device.take() {
-        let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
-        connected.release_to_hardware(config.brightness);
+        connected.release_to_hardware();
     }
 }

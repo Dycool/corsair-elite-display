@@ -169,6 +169,26 @@ impl VirtualDisplayManager {
         unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
     }
 
+    pub fn is_ready() -> bool {
+        if !Self::is_driver_installed() {
+            return false;
+        }
+        let dir = PathBuf::from(r"C:\VirtualDisplayDriver");
+        let edid_path = dir.join("user_edid.bin");
+        let settings_path = dir.join("vdd_settings.xml");
+        if !edid_path.exists() || !settings_path.exists() {
+            return false;
+        }
+        if let Ok(settings) = std::fs::read_to_string(&settings_path) {
+            if !settings.contains("<CustomEdid>true</CustomEdid>") || !settings.contains("<width>480</width>") {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        true
+    }
+
     pub fn is_driver_installed() -> bool {
         for index in 0..64 {
             let mut device: DISPLAY_DEVICEW = unsafe { zeroed() };
@@ -281,17 +301,35 @@ Please run the application as Administrator.".into());
 
     pub fn restart_device() -> Result<(), String> {
         if !Self::is_admin() {
-            return Err("Administrator privileges are required to restart the Virtual Display device.
-
-Please run Corsair Elite Display as Administrator.".into());
+            return Err("Administrator privileges are required to restart the Virtual Display device.\n\nPlease run Corsair Elite Display as Administrator.".into());
         }
 
+        // Restart all MttVDD / Virtual Display Driver instances dynamically
+        if let Ok(output) = Command::new("pnputil.exe")
+            .args(["/enum-devices", "/class", "Display"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut current_id = String::new();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(id) = trimmed.strip_prefix("Instance ID:") {
+                    current_id = id.trim().to_string();
+                } else if (trimmed.contains("Virtual Display Driver") || trimmed.contains("MikeTheTech") || trimmed.contains("MttVDD"))
+                    && !current_id.is_empty()
+                {
+                    let _ = Command::new("pnputil.exe")
+                        .args(["/restart-device", &current_id])
+                        .output();
+                }
+            }
+        }
         let _ = Command::new("pnputil.exe")
-            .args(["/restart-device", r"ROOT\DISPLAY\0002"])
+            .args(["/restart-device", r"Root\MttVDD"])
             .output();
-        let _ = Command::new("pnputil.exe")
-            .args(["/restart-device", "Root\\MttVDD"])
-            .output();
+
+        // Brief delay for PnP reload
+        thread::sleep(Duration::from_millis(500));
 
         Ok(())
     }
