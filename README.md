@@ -13,14 +13,15 @@ Move any window onto the virtual display and it appears on the cooler at up to t
 - **Real second display** — mirror a dedicated Windows monitor instead of uploading individual images or GIFs
 - **Low-latency streaming** — latest-frame-only capture with no buffering or stale-frame queue
 - **Native 30 FPS** — matches the LCD's maximum refresh rate
-- **Flicker-free capture** — the mouse cursor is intentionally excluded from the captured image
+- **Optional mouse overlay** — the mouse is visible on the cooler by default and can be hidden from the tray menu
+- **View presets** — native, 4:3, 16:10, and 16:9 center-zoom views for making content easier to read on the square LCD
 - **Tray-only background app** — no main window; every setting lives in the notification-area menu
 - **Tiny native EXE** — no Electron, WebView, .NET, Python, installer, or bundled runtime
 - **Runtime-only monitor** — the 480×480 Windows display exists only while the app is open and switched on
 - **Hardware hand-off** — switching off or exiting releases the LCD so its saved hardware screen resumes
 - **Starts with Windows** — optional per-user startup toggle
 - **Automatic reconnect** — waits quietly and reconnects if the cooler is unplugged or temporarily unavailable
-- **Useful controls only** — on/off, frame rate, JPEG quality, brightness, rotation, and startup
+- **Useful controls only** — on/off, mouse visibility, view, frame rate, JPEG quality, brightness, rotation, and startup
 
 ## Quick Start
 
@@ -75,7 +76,7 @@ The standalone executable is created at `target\release\corsair-elite-display.ex
 
 ```text
 Windows display
-    ↓  GDI capture (480×480, cursor excluded)
+    ↓  GDI capture with optional cursor overlay and center zoom
 Reusable RGB buffer
     ↓  low-latency JPEG encoding
 Corsair HID image packets

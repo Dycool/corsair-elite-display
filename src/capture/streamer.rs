@@ -18,10 +18,13 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, ICONINFO,
+    MONITORINFOF_PRIMARY,
+};
 
 use crate::corsair::CorsairLcdDevice;
-use crate::settings::Settings;
+use crate::settings::{Settings, ViewMode};
 
 const LCD_SIZE: i32 = 480;
 
@@ -102,7 +105,7 @@ pub fn self_test() -> Result<(), String> {
         .first()
         .ok_or_else(|| "No active display was found".to_string())?;
     let mut capture = GdiCapture::new()?;
-    let image = capture.capture(monitor, 100, 0)?;
+    let image = capture.capture(monitor, 100, 0, ViewMode::Native, true)?;
     let mut jpeg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75)
         .encode(
@@ -128,6 +131,9 @@ struct GdiCapture {
     old_bitmap: HGDIOBJ,
     pixels: *mut u8,
     rgb: Vec<u8>,
+    cursor_handle: *mut c_void,
+    cursor_hotspot_x: i32,
+    cursor_hotspot_y: i32,
 }
 
 impl GdiCapture {
@@ -171,6 +177,9 @@ impl GdiCapture {
                 old_bitmap,
                 pixels: bits.cast(),
                 rgb: vec![0; (LCD_SIZE * LCD_SIZE * 3) as usize],
+                cursor_handle: null_mut(),
+                cursor_hotspot_x: 0,
+                cursor_hotspot_y: 0,
             })
         }
     }
@@ -180,6 +189,8 @@ impl GdiCapture {
         monitor: &MonitorInfo,
         brightness: u8,
         rotation: u16,
+        view_mode: ViewMode,
+        show_mouse: bool,
     ) -> Result<&[u8], String> {
         let source_w = monitor.width();
         let source_h = monitor.height();
@@ -210,7 +221,8 @@ impl GdiCapture {
             self.source_name.clone_from(&monitor.device_name);
         }
 
-        let scale = (LCD_SIZE as f64 / source_w as f64).min(LCD_SIZE as f64 / source_h as f64);
+        let scale = (LCD_SIZE as f64 / source_w as f64).min(LCD_SIZE as f64 / source_h as f64)
+            * view_mode.zoom();
         let dest_w = (source_w as f64 * scale).round() as i32;
         let dest_h = (source_h as f64 * scale).round() as i32;
         let dest_x = (LCD_SIZE - dest_w) / 2;
@@ -235,6 +247,13 @@ impl GdiCapture {
                     "Windows screen capture failed (error {})",
                     GetLastError()
                 ));
+            }
+            if show_mouse {
+                self.draw_cursor(
+                    monitor,
+                    (source_w, source_h),
+                    (dest_x, dest_y, dest_w, dest_h),
+                );
             }
         }
 
@@ -261,6 +280,59 @@ impl GdiCapture {
             }
         }
         Ok(&self.rgb)
+    }
+
+    fn draw_cursor(
+        &mut self,
+        monitor: &MonitorInfo,
+        (source_w, source_h): (i32, i32),
+        (dest_x, dest_y, dest_w, dest_h): (i32, i32, i32, i32),
+    ) {
+        let mut cursor: CURSORINFO = unsafe { zeroed() };
+        cursor.cbSize = size_of::<CURSORINFO>() as u32;
+        if unsafe { GetCursorInfo(&mut cursor) } == 0
+            || cursor.flags & CURSOR_SHOWING == 0
+            || cursor.hCursor.is_null()
+        {
+            return;
+        }
+
+        let local_x = cursor.ptScreenPos.x - monitor.rect.left;
+        let local_y = cursor.ptScreenPos.y - monitor.rect.top;
+        if local_x < 0 || local_y < 0 || local_x >= source_w || local_y >= source_h {
+            return;
+        }
+
+        if self.cursor_handle != cursor.hCursor {
+            let mut icon: ICONINFO = unsafe { zeroed() };
+            if unsafe { GetIconInfo(cursor.hCursor, &mut icon) } != 0 {
+                self.cursor_hotspot_x = icon.xHotspot as i32;
+                self.cursor_hotspot_y = icon.yHotspot as i32;
+                if !icon.hbmMask.is_null() {
+                    unsafe { DeleteObject(icon.hbmMask) };
+                }
+                if !icon.hbmColor.is_null() {
+                    unsafe { DeleteObject(icon.hbmColor) };
+                }
+            }
+            self.cursor_handle = cursor.hCursor;
+        }
+
+        let x = dest_x + local_x * dest_w / source_w - self.cursor_hotspot_x;
+        let y = dest_y + local_y * dest_h / source_h - self.cursor_hotspot_y;
+        unsafe {
+            DrawIconEx(
+                self.memory_dc,
+                x,
+                y,
+                cursor.hCursor,
+                0,
+                0,
+                0,
+                null_mut(),
+                DI_NORMAL,
+            );
+        }
     }
 }
 
@@ -457,7 +529,13 @@ fn stream_loop(
 
         jpeg.clear();
         let result = capture
-            .capture(monitor, config.brightness, config.rotation)
+            .capture(
+                monitor,
+                config.brightness,
+                config.rotation,
+                config.view_mode,
+                config.show_mouse,
+            )
             .and_then(|pixels| {
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, config.quality)
                     .encode(

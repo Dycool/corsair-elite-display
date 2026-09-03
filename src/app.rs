@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::{StreamController, get_monitors};
-use crate::settings::{Settings, set_startup, startup_enabled};
+use crate::settings::{Settings, ViewMode, set_startup, startup_enabled};
 use crate::virtual_display::VirtualDisplayManager;
 
 pub const WINDOW_CLASS: &str = "CorsairEliteDisplayWindow";
@@ -24,6 +24,8 @@ const TIMER_STATUS: usize = 1;
 const MENU_TOGGLE: usize = 200;
 const MENU_STARTUP: usize = 201;
 const MENU_EXIT: usize = 202;
+const MENU_SHOW_MOUSE: usize = 203;
+const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
 const MENU_BRIGHTNESS_BASE: usize = 500;
@@ -207,6 +209,13 @@ impl AppState {
         }
     }
 
+    fn set_view_mode(&mut self, index: usize) {
+        if let Some(value) = ViewMode::ALL.get(index) {
+            self.settings.view_mode = *value;
+            self.apply();
+        }
+    }
+
     fn tray_menu(&mut self) {
         unsafe {
             let menu = CreatePopupMenu();
@@ -214,17 +223,33 @@ impl AppState {
             let quality = CreatePopupMenu();
             let brightness = CreatePopupMenu();
             let rotation = CreatePopupMenu();
+            let view = CreatePopupMenu();
             if menu.is_null()
                 || fps.is_null()
                 || quality.is_null()
                 || brightness.is_null()
                 || rotation.is_null()
+                || view.is_null()
             {
                 return;
             }
 
             append_checked(menu, MENU_TOGGLE, "Second screen", self.settings.streaming);
+            append_checked(
+                menu,
+                MENU_SHOW_MOUSE,
+                "Show mouse",
+                self.settings.show_mouse,
+            );
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            for (index, value) in ViewMode::ALL.iter().enumerate() {
+                append_checked(
+                    view,
+                    MENU_VIEW_BASE + index,
+                    value.label(),
+                    self.settings.view_mode == *value,
+                );
+            }
             for (index, value) in FPS_VALUES.iter().enumerate() {
                 append_checked(
                     fps,
@@ -261,6 +286,7 @@ impl AppState {
             append_submenu(menu, quality, "Quality");
             append_submenu(menu, brightness, "Brightness");
             append_submenu(menu, rotation, "Rotation");
+            append_submenu(menu, view, "View");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_checked(menu, MENU_STARTUP, "Start with Windows", startup_enabled());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -283,6 +309,10 @@ impl AppState {
 
             match command {
                 MENU_TOGGLE => self.toggle(),
+                MENU_SHOW_MOUSE => {
+                    self.settings.show_mouse = !self.settings.show_mouse;
+                    self.apply();
+                }
                 MENU_STARTUP => {
                     if let Err(error) = set_startup(!startup_enabled()) {
                         show_error(self.hwnd, &error);
@@ -308,6 +338,9 @@ impl AppState {
                     .contains(&id) =>
                 {
                     self.set_rotation(id - MENU_ROTATION_BASE)
+                }
+                id if (MENU_VIEW_BASE..MENU_VIEW_BASE + ViewMode::ALL.len()).contains(&id) => {
+                    self.set_view_mode(id - MENU_VIEW_BASE)
                 }
                 _ => {}
             }

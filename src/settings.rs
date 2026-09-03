@@ -12,6 +12,55 @@ use windows_sys::Win32::System::Registry::{
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "CorsairEliteDisplay";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    Native,
+    Zoom4x3,
+    Zoom16x10,
+    Zoom16x9,
+}
+
+impl ViewMode {
+    pub const ALL: [Self; 4] = [Self::Native, Self::Zoom4x3, Self::Zoom16x10, Self::Zoom16x9];
+
+    pub fn zoom(self) -> f64 {
+        match self {
+            Self::Native => 1.0,
+            Self::Zoom4x3 => 4.0 / 3.0,
+            Self::Zoom16x10 => 16.0 / 10.0,
+            Self::Zoom16x9 => 16.0 / 9.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Native",
+            Self::Zoom4x3 => "4:3 zoom",
+            Self::Zoom16x10 => "16:10 zoom",
+            Self::Zoom16x9 => "16:9 zoom",
+        }
+    }
+
+    fn from_setting(value: &str) -> Self {
+        match value.trim() {
+            "4:3" => Self::Zoom4x3,
+            "16:10" => Self::Zoom16x10,
+            "16:9" => Self::Zoom16x9,
+            _ => Self::Native,
+        }
+    }
+
+    fn setting_value(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Zoom4x3 => "4:3",
+            Self::Zoom16x10 => "16:10",
+            Self::Zoom16x9 => "16:9",
+        }
+    }
+}
+
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
@@ -23,6 +72,8 @@ pub struct Settings {
     pub quality: u8,
     pub brightness: u8,
     pub rotation: u16,
+    pub view_mode: ViewMode,
+    pub show_mouse: bool,
     pub streaming: bool,
 }
 
@@ -34,6 +85,8 @@ impl Default for Settings {
             quality: 75,
             brightness: 100,
             rotation: 0,
+            view_mode: ViewMode::Native,
+            show_mouse: true,
             streaming: true,
         }
     }
@@ -75,6 +128,8 @@ impl Settings {
                         0
                     };
                 }
+                "view" => result.view_mode = ViewMode::from_setting(value),
+                "show_mouse" => result.show_mouse = value.trim() != "false",
                 "streaming" => result.streaming = value.trim() != "false",
                 _ => {}
             }
@@ -88,8 +143,15 @@ impl Settings {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let text = format!(
-            "monitor={}\nfps={}\nquality={}\nbrightness={}\nrotation={}\nstreaming={}\n",
-            self.monitor, self.fps, self.quality, self.brightness, self.rotation, self.streaming
+            "monitor={}\nfps={}\nquality={}\nbrightness={}\nrotation={}\nview={}\nshow_mouse={}\nstreaming={}\n",
+            self.monitor,
+            self.fps,
+            self.quality,
+            self.brightness,
+            self.rotation,
+            self.view_mode.setting_value(),
+            self.show_mouse,
+            self.streaming
         );
         fs::write(path, text).map_err(|e| e.to_string())
     }
