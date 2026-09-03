@@ -21,10 +21,11 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_APP: u32 = WM_APP + 2;
 const TIMER_STATUS: usize = 1;
 
-const MENU_TOGGLE: usize = 200;
-const MENU_STARTUP: usize = 201;
-const MENU_EXIT: usize = 202;
-const MENU_SHOW_MOUSE: usize = 203;
+const MENU_ON: usize = 200;
+const MENU_OFF: usize = 201;
+const MENU_STARTUP: usize = 202;
+const MENU_EXIT: usize = 203;
+const MENU_SHOW_MOUSE: usize = 204;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
@@ -83,6 +84,7 @@ impl AppState {
         if self.icon_off.is_null() {
             self.icon_off = self.icon_on;
         }
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
@@ -234,12 +236,8 @@ impl AppState {
                 return;
             }
 
-            append_checked(
-                menu,
-                MENU_TOGGLE,
-                if self.settings.streaming { "On" } else { "Off" },
-                self.settings.streaming,
-            );
+            append_checked(menu, MENU_ON, "On", self.settings.streaming);
+            append_checked(menu, MENU_OFF, "Off", !self.settings.streaming);
             append_checked(
                 menu,
                 MENU_SHOW_MOUSE,
@@ -313,7 +311,12 @@ impl AppState {
             PostMessageW(self.hwnd, WM_NULL, 0, 0);
 
             match command {
-                MENU_TOGGLE => self.toggle(),
+                MENU_ON if !self.settings.streaming => {
+                    self.toggle();
+                }
+                MENU_OFF if self.settings.streaming => {
+                    self.toggle();
+                }
                 MENU_SHOW_MOUSE => {
                     self.settings.show_mouse = !self.settings.show_mouse;
                     self.apply();
@@ -355,6 +358,7 @@ impl AppState {
 
 impl Drop for AppState {
     fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         self.controller.set_running(false);
         VirtualDisplayManager::deactivate();
     }
@@ -410,8 +414,14 @@ unsafe extern "system" fn window_proc(
                 return 0;
             }
             WM_TRAY => {
-                if matches!(lparam as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
-                    state.tray_menu();
+                match lparam as u32 {
+                    WM_LBUTTONUP => {
+                        state.toggle();
+                    }
+                    WM_RBUTTONUP | WM_CONTEXTMENU => {
+                        state.tray_menu();
+                    }
+                    _ => {}
                 }
                 return 0;
             }

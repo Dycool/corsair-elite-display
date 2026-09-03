@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::{GetLastError, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, COLORONCOLOR, CreateCompatibleDC, CreateDCW,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-    GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, PatBlt, ReleaseDC, SRCCOPY,
+    GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, BitBlt, PatBlt, ReleaseDC, SRCCOPY,
     SelectObject, SetStretchBltMode, StretchBlt,
 };
 use windows_sys::Win32::System::Threading::{
@@ -139,6 +139,18 @@ struct GdiCapture {
 impl GdiCapture {
     fn new() -> Result<Self, String> {
         unsafe {
+            let default_name: Vec<u16> = OsStr::new("Default").encode_wide().chain(Some(0)).collect();
+            let hdesk = windows_sys::Win32::System::StationsAndDesktops::OpenDesktopW(
+                default_name.as_ptr(),
+                0,
+                0,
+                0x01FF,
+            );
+            if !hdesk.is_null() {
+                windows_sys::Win32::System::StationsAndDesktops::SetThreadDesktop(hdesk);
+                windows_sys::Win32::System::StationsAndDesktops::CloseDesktop(hdesk);
+            }
+
             let desktop_dc = GetDC(null_mut());
             if desktop_dc.is_null() {
                 return Err("Could not access the Windows desktop".into());
@@ -228,25 +240,49 @@ impl GdiCapture {
         let dest_x = (LCD_SIZE - dest_w) / 2;
         let dest_y = (LCD_SIZE - dest_h) / 2;
         unsafe {
-            PatBlt(self.memory_dc, 0, 0, LCD_SIZE, LCD_SIZE, BLACKNESS);
-            if StretchBlt(
-                self.memory_dc,
-                dest_x,
-                dest_y,
-                dest_w,
-                dest_h,
-                self.source_dc,
-                0,
-                0,
-                source_w,
-                source_h,
-                SRCCOPY,
-            ) == 0
-            {
-                return Err(format!(
-                    "Windows screen capture failed (error {})",
-                    GetLastError()
-                ));
+            let is_exact_native =
+                dest_w == LCD_SIZE && dest_h == LCD_SIZE && dest_x == 0 && dest_y == 0;
+            if is_exact_native {
+                // Direct 1:1 BitBlt: lowest latency, bypasses scaling and canvas clearing
+                if BitBlt(
+                    self.memory_dc,
+                    0,
+                    0,
+                    LCD_SIZE,
+                    LCD_SIZE,
+                    self.source_dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                ) == 0
+                {
+                    return Err(format!(
+                        "Windows screen capture failed (error {})",
+                        GetLastError()
+                    ));
+                }
+            } else {
+                // Letterboxed or scaled view: clear background and StretchBlt
+                PatBlt(self.memory_dc, 0, 0, LCD_SIZE, LCD_SIZE, BLACKNESS);
+                if StretchBlt(
+                    self.memory_dc,
+                    dest_x,
+                    dest_y,
+                    dest_w,
+                    dest_h,
+                    self.source_dc,
+                    0,
+                    0,
+                    source_w,
+                    source_h,
+                    SRCCOPY,
+                ) == 0
+                {
+                    return Err(format!(
+                        "Windows screen capture failed (error {})",
+                        GetLastError()
+                    ));
+                }
             }
             if show_mouse {
                 self.draw_cursor(
@@ -259,24 +295,90 @@ impl GdiCapture {
 
         let source =
             unsafe { std::slice::from_raw_parts(self.pixels, (LCD_SIZE * LCD_SIZE * 4) as usize) };
-        let brightness = brightness as u16;
         let size = LCD_SIZE as usize;
-        for y in 0..size {
-            for x in 0..size {
-                let (sx, sy) = match rotation {
-                    90 => (y, size - 1 - x),
-                    180 => (size - 1 - x, size - 1 - y),
-                    270 => (size - 1 - y, x),
-                    _ => (x, y),
-                };
-                let source_index = (sy * size + sx) * 4;
-                let target_index = (y * size + x) * 3;
-                self.rgb[target_index] =
-                    ((source[source_index + 2] as u16 * brightness) / 100) as u8;
-                self.rgb[target_index + 1] =
-                    ((source[source_index + 1] as u16 * brightness) / 100) as u8;
-                self.rgb[target_index + 2] =
-                    ((source[source_index] as u16 * brightness) / 100) as u8;
+
+        // Precompute brightness lookup table to eliminate 691,200 integer divisions per frame
+        let mut lut = [0u8; 256];
+        if brightness < 100 {
+            let b = brightness as u16;
+            for (i, item) in lut.iter_mut().enumerate() {
+                *item = ((i as u16 * b) / 100) as u8;
+            }
+        }
+
+        match rotation {
+            90 => {
+                for y in 0..size {
+                    for x in 0..size {
+                        let sx = y;
+                        let sy = size - 1 - x;
+                        let source_index = (sy * size + sx) * 4;
+                        let target_index = (y * size + x) * 3;
+                        if brightness == 100 {
+                            self.rgb[target_index] = source[source_index + 2];
+                            self.rgb[target_index + 1] = source[source_index + 1];
+                            self.rgb[target_index + 2] = source[source_index];
+                        } else {
+                            self.rgb[target_index] = lut[source[source_index + 2] as usize];
+                            self.rgb[target_index + 1] = lut[source[source_index + 1] as usize];
+                            self.rgb[target_index + 2] = lut[source[source_index] as usize];
+                        }
+                    }
+                }
+            }
+            180 => {
+                for y in 0..size {
+                    for x in 0..size {
+                        let sx = size - 1 - x;
+                        let sy = size - 1 - y;
+                        let source_index = (sy * size + sx) * 4;
+                        let target_index = (y * size + x) * 3;
+                        if brightness == 100 {
+                            self.rgb[target_index] = source[source_index + 2];
+                            self.rgb[target_index + 1] = source[source_index + 1];
+                            self.rgb[target_index + 2] = source[source_index];
+                        } else {
+                            self.rgb[target_index] = lut[source[source_index + 2] as usize];
+                            self.rgb[target_index + 1] = lut[source[source_index + 1] as usize];
+                            self.rgb[target_index + 2] = lut[source[source_index] as usize];
+                        }
+                    }
+                }
+            }
+            270 => {
+                for y in 0..size {
+                    for x in 0..size {
+                        let sx = size - 1 - y;
+                        let sy = x;
+                        let source_index = (sy * size + sx) * 4;
+                        let target_index = (y * size + x) * 3;
+                        if brightness == 100 {
+                            self.rgb[target_index] = source[source_index + 2];
+                            self.rgb[target_index + 1] = source[source_index + 1];
+                            self.rgb[target_index + 2] = source[source_index];
+                        } else {
+                            self.rgb[target_index] = lut[source[source_index + 2] as usize];
+                            self.rgb[target_index + 1] = lut[source[source_index + 1] as usize];
+                            self.rgb[target_index + 2] = lut[source[source_index] as usize];
+                        }
+                    }
+                }
+            }
+            _ => {
+                // 0 degree / default: sequential memory access auto-vectorized by LLVM (SSE2/AVX2)
+                if brightness == 100 {
+                    for (src, dst) in source.chunks_exact(4).zip(self.rgb.chunks_exact_mut(3)) {
+                        dst[0] = src[2];
+                        dst[1] = src[1];
+                        dst[2] = src[0];
+                    }
+                } else {
+                    for (src, dst) in source.chunks_exact(4).zip(self.rgb.chunks_exact_mut(3)) {
+                        dst[0] = lut[src[2] as usize];
+                        dst[1] = lut[src[1] as usize];
+                        dst[2] = lut[src[0] as usize];
+                    }
+                }
             }
         }
         Ok(&self.rgb)
@@ -593,7 +695,7 @@ fn stream_loop(
             // only for the final millisecond to keep latency and jitter low
             // without continuously consuming a CPU core.
             let remaining = next_frame - now;
-            let spin_window = Duration::from_millis(1);
+            let spin_window = Duration::from_micros(500);
             if remaining > spin_window {
                 thread::sleep(remaining - spin_window);
             }

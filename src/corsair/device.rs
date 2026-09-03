@@ -62,6 +62,7 @@ fn to_u16_vec(s: &str) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(test)]
 fn frame_packet(chunk: &[u8], part_num: u16, is_end: bool) -> [u8; 1024] {
     debug_assert!(chunk.len() <= 1016);
     let mut packet = [0u8; 1024];
@@ -161,15 +162,21 @@ impl CorsairLcdDevice {
         let max_len = 1024;
         let header_size = 8;
         let real_max_len = max_len - header_size;
+        let total_len = jpeg_data.len();
+        let mut packet = [0u8; 1024];
+        packet[0] = 0x02;
+        packet[1] = 0x05;
+        packet[2] = 0x40;
+
         for (part_num, chunk) in (0_u16..).zip(jpeg_data.chunks(real_max_len)) {
             let chunk_len = chunk.len();
-            let is_end = if (part_num as usize * real_max_len) + chunk_len >= jpeg_data.len() {
-                1u8
-            } else {
-                0u8
-            };
+            let is_end = (part_num as usize * real_max_len) + chunk_len >= total_len;
 
-            let packet = frame_packet(chunk, part_num, is_end != 0);
+            packet[3] = u8::from(is_end);
+            packet[4..6].copy_from_slice(&part_num.to_le_bytes());
+            packet[6..8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
+            packet[8..8 + chunk_len].copy_from_slice(chunk);
+            packet[8 + chunk_len..].fill(0);
 
             self.write_packet(&packet)?;
         }
