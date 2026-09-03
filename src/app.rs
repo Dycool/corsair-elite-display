@@ -6,8 +6,8 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -180,6 +180,18 @@ impl AppState {
     fn remove_tray_icon(&self) {
         let icon = self.tray_data("");
         unsafe { Shell_NotifyIconW(NIM_DELETE, &icon) };
+    }
+
+    fn show_already_running_notification(&self) {
+        let mut icon: NOTIFYICONDATAW = unsafe { zeroed() };
+        icon.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = self.hwnd;
+        icon.uID = 1;
+        icon.uFlags = NIF_INFO;
+        copy_wide(&mut icon.szInfo, "Corsair Elite Display is already active in your system tray.");
+        copy_wide(&mut icon.szInfoTitle, APP_TITLE);
+        icon.dwInfoFlags = NIIF_INFO;
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon) };
     }
 
     fn set_fps(&mut self, index: usize) {
@@ -424,6 +436,7 @@ unsafe extern "system" fn window_proc(
                 return 0;
             }
             WM_SHOW_APP => {
+                state.show_already_running_notification();
                 state.tray_menu();
                 return 0;
             }

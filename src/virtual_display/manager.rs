@@ -5,12 +5,8 @@ use std::ptr::null;
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Graphics::Gdi::{
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, EnumDisplayDevicesW,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
 fn from_wide(buffer: &[u16]) -> String {
@@ -73,28 +69,5 @@ impl VirtualDisplayManager {
         if monitor_attached() {
             let _ = display_switch("/internal");
         }
-    }
-
-    pub fn spawn_watchdog() {
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
-        let _ = Command::new(exe)
-            .args(["--display-watchdog", &std::process::id().to_string()])
-            .spawn();
-    }
-}
-
-pub fn run_watchdog(parent_pid: u32) {
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
-    if !handle.is_null() {
-        unsafe { WaitForSingleObject(handle, u32::MAX) };
-        unsafe { CloseHandle(handle) };
-    }
-    for _ in 0..10 {
-        if display_switch("/internal").is_ok() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
     }
 }
