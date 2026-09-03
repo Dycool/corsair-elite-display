@@ -278,6 +278,11 @@ impl eframe::App for EliteDisplayApp {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
+                    if ui.button("⚡ Enable 480x480 Virtual Monitor").on_hover_text("Installs/activates the 480x480 second monitor").clicked() {
+                        let _ = VirtualDisplayManager::launch_installer_script();
+                        self.action_message = Some(("Installer launched! Click 'Yes' on the UAC prompt.".to_string(), Instant::now()));
+                    }
+
                     if ui.button("Configure 480x480").on_hover_text("Writes native 480x480 profile to C:\\VirtualDisplayDriver").clicked() {
                         match VirtualDisplayManager::write_480_config() {
                             Ok(_) => {

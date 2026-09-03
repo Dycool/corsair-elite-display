@@ -103,4 +103,15 @@ impl VirtualDisplayManager {
             Err(format!("Winget exited with status: {}", status))
         }
     }
+
+    pub fn launch_installer_script() -> Result<(), String> {
+        let _ = Self::write_480_config();
+        let bat_path = r"C:\Users\diogo\repos\corsair-elite-display\Install-Virtual-Display.bat";
+        Command::new("cmd")
+            .args(["/c", "start", "", bat_path])
+            .spawn()
+            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+        Ok(())
+    }
+
 }
