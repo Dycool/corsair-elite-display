@@ -560,9 +560,9 @@ fn stream_loop(
     stats: Arc<Mutex<StreamStats>>,
 ) {
     unsafe {
-        // The panel only presents 30 frames per second. Keeping the capture
-        // worker at high priority and avoiding timer oversleep helps each
-        // frame reach that presentation slot as soon as possible.
+        // The Corsair LCD panel has a physical refresh limit of 30 Hz.
+        // Keeping the capture worker at high priority avoids timer jitter
+        // and delivers sampled frames directly to the hardware presentation slot.
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
     let mut capture = match GdiCapture::new() {
@@ -577,9 +577,13 @@ fn stream_loop(
     let mut second_started = Instant::now();
     let mut frames_this_second = 0u32;
     let mut total_frames = 0u64;
+    let mut last_frame_bytes = 0usize;
     let mut monitors = get_monitors();
     let mut monitors_refreshed = Instant::now();
     let mut jpeg = Vec::with_capacity(64 * 1024);
+    let mut prev_pixels: Vec<u8> = Vec::new();
+    let mut last_sent = Instant::now() - Duration::from_secs(10);
+    let mut last_config = Settings::default();
     let mut next_frame = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
@@ -587,7 +591,8 @@ fn stream_loop(
             if let Some(connected) = device.take() {
                 connected.release_to_hardware();
             }
-            set_status(&stats, "Off · hardware screen restored");
+            prev_pixels.clear();
+            set_status(&stats, "Off – hardware screen restored");
             next_frame = Instant::now();
             thread::sleep(Duration::from_millis(50));
             continue;
@@ -595,7 +600,10 @@ fn stream_loop(
 
         if device.is_none() && Instant::now() >= next_connect {
             match CorsairLcdDevice::open() {
-                Ok(found) => device = Some(found),
+                Ok(found) => {
+                    device = Some(found);
+                    prev_pixels.clear();
+                }
                 Err(error) => {
                     set_status(&stats, error);
                     next_connect = Instant::now() + Duration::from_secs(2);
@@ -609,6 +617,18 @@ fn stream_loop(
 
         let frame_started = Instant::now();
         let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
+
+        // If rendering parameters changed, invalidate cached frame so update displays immediately
+        if config.brightness != last_config.brightness
+            || config.rotation != last_config.rotation
+            || config.view_mode != last_config.view_mode
+            || config.show_mouse != last_config.show_mouse
+            || config.quality != last_config.quality
+        {
+            prev_pixels.clear();
+            last_config = config.clone();
+        }
+
         if monitors_refreshed.elapsed() >= Duration::from_secs(1) {
             monitors = get_monitors();
             monitors_refreshed = Instant::now();
@@ -632,22 +652,31 @@ fn stream_loop(
                     .find(|monitor| monitor.width() == LCD_SIZE && monitor.height() == LCD_SIZE)
             });
         let Some(monitor) = selected else {
-            set_status(&stats, "Preparing the 480×480 second screen…");
+            prev_pixels.clear();
+            set_status(&stats, "Preparing the 480x480 second screen…");
             thread::sleep(Duration::from_millis(250));
             continue;
         };
 
-        jpeg.clear();
-        let result = capture
-            .capture(
-                monitor,
-                config.brightness,
-                config.rotation,
-                config.view_mode,
-                config.show_mouse,
-            )
-            .and_then(|pixels| {
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, config.quality)
+        // Capture current desktop surface (including cursor if enabled)
+        let captured = capture.capture(
+            monitor,
+            config.brightness,
+            config.rotation,
+            config.view_mode,
+            config.show_mouse,
+        );
+
+        let result: Result<Option<usize>, String> = (|| {
+            let pixels = captured?;
+            let is_dirty = prev_pixels.is_empty() || prev_pixels.as_slice() != pixels;
+            // Keepalive: send at least one frame per second so cooler firmware doesn't time out to hardware mode
+            let keepalive_due = last_sent.elapsed() >= Duration::from_millis(1000);
+
+            if is_dirty || keepalive_due {
+                jpeg.clear();
+                let effective_quality = config.quality.clamp(35, 85);
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, effective_quality)
                     .encode(
                         pixels,
                         LCD_SIZE as u32,
@@ -655,22 +684,50 @@ fn stream_loop(
                         ExtendedColorType::Rgb8,
                     )
                     .map_err(|e| format!("JPEG encoding failed: {e}"))?;
+
+                // Hardware guard: if complex content pushed the JPEG over 24 KB (>24 packets),
+                // re-encode with lower quality to ensure USB transfer and MCU decode never exceed 33ms.
+                if jpeg.len() > 24 * 1024 && effective_quality > 50 {
+                    jpeg.clear();
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 50)
+                        .encode(
+                            pixels,
+                            LCD_SIZE as u32,
+                            LCD_SIZE as u32,
+                            ExtendedColorType::Rgb8,
+                        )
+                        .map_err(|e| format!("JPEG fallback failed: {e}"))?;
+                }
+
                 let bytes = jpeg.len();
                 device.as_ref().unwrap().send_frame(&jpeg)?;
-                Ok(bytes)
-            });
+                last_sent = Instant::now();
+
+                if prev_pixels.len() != pixels.len() {
+                    prev_pixels.resize(pixels.len(), 0);
+                }
+                prev_pixels.copy_from_slice(pixels);
+                Ok(Some(bytes))
+            } else {
+                // Frame is identical to previous: skip encoding and USB write.
+                // This keeps the cooler microcontroller idle with zero queued packets,
+                // so when new content or mouse motion arrives, it renders with zero delay!
+                Ok(None)
+            }
+        })();
 
         match result {
-            Ok(frame_bytes) => {
+            Ok(Some(frame_bytes)) => {
                 total_frames += 1;
                 frames_this_second += 1;
+                last_frame_bytes = frame_bytes;
                 if second_started.elapsed() >= Duration::from_secs(1) {
                     let measured_fps =
                         frames_this_second as f32 / second_started.elapsed().as_secs_f32();
                     if let Ok(mut current) = stats.lock() {
                         current.fps = measured_fps;
                         current.frame_count = total_frames;
-                        current.frame_bytes = frame_bytes;
+                        current.frame_bytes = last_frame_bytes;
                         current.latency_ms = frame_started.elapsed().as_secs_f32() * 1000.0;
                         current.status =
                             format!("Streaming {} at {:.1} FPS", monitor.label, measured_fps);
@@ -679,21 +736,43 @@ fn stream_loop(
                     second_started = Instant::now();
                 }
             }
+            Ok(None) => {
+                // Idle frame (suppressed)
+                if second_started.elapsed() >= Duration::from_secs(1) {
+                    let measured_fps =
+                        frames_this_second as f32 / second_started.elapsed().as_secs_f32();
+                    if let Ok(mut current) = stats.lock() {
+                        current.fps = measured_fps;
+                        current.frame_count = total_frames;
+                        current.frame_bytes = last_frame_bytes;
+                        current.latency_ms = frame_started.elapsed().as_secs_f32() * 1000.0;
+                        current.status = if measured_fps < 1.0 {
+                            format!("Streaming {} (Idle / 30 FPS ready)", monitor.label)
+                        } else {
+                            format!("Streaming {} at {:.1} FPS", monitor.label, measured_fps)
+                        };
+                    }
+                    frames_this_second = 0;
+                    second_started = Instant::now();
+                }
+            }
             Err(error) => {
                 set_status(&stats, error);
                 device = None;
+                prev_pixels.clear();
                 next_connect = Instant::now() + Duration::from_secs(1);
             }
         }
 
-        let target = Duration::from_secs_f64(1.0 / config.fps.max(1) as f64);
-        next_frame += target;
+        // Frame pacing strictly adapted to the hardware limit (capped at 30 FPS)
+        let effective_fps = config.fps.clamp(1, 30);
+        let target = Duration::from_secs_f64(1.0 / effective_fps as f64);
         let now = Instant::now();
-        if next_frame > now {
-            // Windows' normal sleep cadence can overshoot by several
-            // milliseconds. Sleep for most of the interval, then yield/spin
-            // only for the final millisecond to keep latency and jitter low
-            // without continuously consuming a CPU core.
+        if now >= next_frame {
+            // If processing or USB transfer took longer than expected, do NOT run back-to-back.
+            // Reset next_frame to give the microcontroller its full interval to complete scanout.
+            next_frame = now + target;
+        } else {
             let remaining = next_frame - now;
             let spin_window = Duration::from_micros(500);
             if remaining > spin_window {
@@ -702,8 +781,7 @@ fn stream_loop(
             while Instant::now() < next_frame {
                 std::hint::spin_loop();
             }
-        } else {
-            next_frame = now;
+            next_frame += target;
         }
     }
 

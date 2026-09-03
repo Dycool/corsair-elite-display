@@ -31,7 +31,7 @@ const MENU_QUALITY_BASE: usize = 400;
 const MENU_BRIGHTNESS_BASE: usize = 500;
 const MENU_ROTATION_BASE: usize = 600;
 
-const FPS_VALUES: [u32; 4] = [15, 30, 45, 60];
+const FPS_VALUES: [u32; 4] = [10, 15, 20, 30];
 const QUALITY_VALUES: [u8; 4] = [55, 65, 75, 85];
 const BRIGHTNESS_VALUES: [u8; 4] = [25, 50, 75, 100];
 const ROTATION_VALUES: [u16; 4] = [0, 90, 180, 270];
@@ -252,10 +252,15 @@ impl AppState {
                 );
             }
             for (index, value) in FPS_VALUES.iter().enumerate() {
+                let label = if *value == 30 {
+                    "30 FPS (Hardware Max)".to_string()
+                } else {
+                    format!("{value} FPS")
+                };
                 append_checked(
                     fps,
                     MENU_FPS_BASE + index,
-                    &format!("{value} FPS"),
+                    &label,
                     self.settings.fps == *value,
                 );
             }

@@ -82,7 +82,7 @@ impl Default for Settings {
         Self {
             monitor: String::new(),
             fps: 30,
-            quality: 75,
+            quality: 65,
             brightness: 100,
             rotation: 0,
             view_mode: ViewMode::Native,
@@ -116,7 +116,7 @@ impl Settings {
             match key.trim() {
                 "monitor" => result.monitor = value.trim().to_owned(),
                 "fps" => result.fps = value.trim().parse().unwrap_or(30).clamp(5, 30),
-                "quality" => result.quality = value.trim().parse().unwrap_or(75).clamp(35, 95),
+                "quality" => result.quality = value.trim().parse().unwrap_or(65).clamp(35, 95),
                 "brightness" => {
                     result.brightness = value.trim().parse().unwrap_or(100).clamp(10, 100)
                 }
