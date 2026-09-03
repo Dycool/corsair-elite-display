@@ -21,18 +21,17 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_APP: u32 = WM_APP + 2;
 const TIMER_STATUS: usize = 1;
 
-const MENU_ON: usize = 200;
-const MENU_OFF: usize = 201;
-const MENU_STARTUP: usize = 202;
-const MENU_EXIT: usize = 203;
-const MENU_SHOW_MOUSE: usize = 204;
+const MENU_TOGGLE: usize = 200;
+const MENU_STARTUP: usize = 201;
+const MENU_EXIT: usize = 202;
+const MENU_SHOW_MOUSE: usize = 203;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
 const MENU_BRIGHTNESS_BASE: usize = 500;
 const MENU_ROTATION_BASE: usize = 600;
 
-const FPS_VALUES: [u32; 4] = [10, 15, 20, 30];
+const FPS_VALUES: [u32; 4] = [15, 30, 45, 60];
 const QUALITY_VALUES: [u8; 4] = [55, 65, 75, 85];
 const BRIGHTNESS_VALUES: [u8; 4] = [25, 50, 75, 100];
 const ROTATION_VALUES: [u16; 4] = [0, 90, 180, 270];
@@ -236,8 +235,7 @@ impl AppState {
                 return;
             }
 
-            append_checked(menu, MENU_ON, "On", self.settings.streaming);
-            append_checked(menu, MENU_OFF, "Off", !self.settings.streaming);
+            append_checked(menu, MENU_TOGGLE, "On/Off", self.settings.streaming);
             append_checked(
                 menu,
                 MENU_SHOW_MOUSE,
@@ -311,12 +309,7 @@ impl AppState {
             PostMessageW(self.hwnd, WM_NULL, 0, 0);
 
             match command {
-                MENU_ON if !self.settings.streaming => {
-                    self.toggle();
-                }
-                MENU_OFF if self.settings.streaming => {
-                    self.toggle();
-                }
+                MENU_TOGGLE => self.toggle(),
                 MENU_SHOW_MOUSE => {
                     self.settings.show_mouse = !self.settings.show_mouse;
                     self.apply();
