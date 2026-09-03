@@ -1,118 +1,100 @@
-use std::ffi::OsStr;
-use std::fs;
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::mem::{size_of, zeroed};
+use std::path::PathBuf;
 use std::process::Command;
-use std::ptr::null_mut;
+use std::ptr::null;
+use std::thread;
+use std::time::Duration;
 
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_SHOWNORMAL,
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Graphics::Gdi::{
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, EnumDisplayDevicesW,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
-const VDD_DIR: &str = r"C:\VirtualDisplayDriver";
-const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
-const DEVCON: &[u8] = include_bytes!("../../Dependencies/devcon.exe");
-const DRIVER_INF: &[u8] = include_bytes!("../../SignedDrivers/x86/VDD/MttVDD.inf");
-const DRIVER_CAT: &[u8] = include_bytes!("../../SignedDrivers/x86/VDD/mttvdd.cat");
-const DRIVER_DLL: &[u8] = include_bytes!("../../SignedDrivers/x86/VDD/MttVDD.dll");
+fn from_wide(buffer: &[u16]) -> String {
+    let length = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
+}
 
-const SETTINGS_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<vdd_settings>
-  <monitors><count>1</count></monitors>
-  <gpu><friendlyname>default</friendlyname></gpu>
-  <global><g_refresh_rate>30</g_refresh_rate><g_refresh_rate>60</g_refresh_rate></global>
-  <resolutions>
-    <resolution><width>480</width><height>480</height><refresh_rate>30</refresh_rate></resolution>
-    <resolution><width>480</width><height>480</height><refresh_rate>60</refresh_rate></resolution>
-  </resolutions>
-  <options>
-    <CustomEdid>false</CustomEdid><PreventSpoof>false</PreventSpoof>
-    <EdidCeaOverride>false</EdidCeaOverride><HardwareCursor>true</HardwareCursor>
-    <SDR10bit>false</SDR10bit><HDRPlus>false</HDRPlus>
-    <logging>false</logging><debuglogging>false</debuglogging>
-  </options>
-</vdd_settings>
-"#;
+fn monitor_attached() -> bool {
+    for index in 0..64 {
+        let mut device: DISPLAY_DEVICEW = unsafe { zeroed() };
+        device.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+        if unsafe { EnumDisplayDevicesW(null(), index, &mut device, 0) } == 0 {
+            break;
+        }
+        let id = from_wide(&device.DeviceID).to_ascii_lowercase();
+        if id.contains("mttvdd") && device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0 {
+            return true;
+        }
+    }
+    false
+}
 
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
+fn display_switch(mode: &str) -> Result<(), String> {
+    let system_root = std::env::var_os("SystemRoot").ok_or("Windows directory is unavailable")?;
+    let executable = PathBuf::from(system_root)
+        .join("System32")
+        .join("DisplaySwitch.exe");
+    let status = Command::new(executable)
+        .arg(mode)
+        .status()
+        .map_err(|error| format!("Could not change the display layout: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Windows could not change the display layout".into())
+    }
 }
 
 pub struct VirtualDisplayManager;
 
 impl VirtualDisplayManager {
-    pub fn request_install() -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let operation = wide("runas");
-        let file = wide(&exe.to_string_lossy());
-        let parameters = wide("--install-driver");
-        let result = unsafe {
-            ShellExecuteW(
-                null_mut(),
-                operation.as_ptr(),
-                file.as_ptr(),
-                parameters.as_ptr(),
-                null_mut(),
-                SW_SHOWNORMAL,
-            )
-        } as isize;
-        if result <= 32 {
-            Err(format!(
-                "Windows could not start the administrator installer ({result})"
-            ))
-        } else {
-            Ok(())
+    pub fn activate() -> Result<(), String> {
+        if monitor_attached() {
+            return Ok(());
+        }
+        display_switch("/extend")?;
+        for _ in 0..30 {
+            if monitor_attached() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err("The runtime virtual screen is not available on this PC".into())
+    }
+
+    pub fn deactivate() {
+        if monitor_attached() {
+            let _ = display_switch("/internal");
         }
     }
-}
 
-fn write_payload(directory: &Path) -> Result<PathBuf, String> {
-    fs::create_dir_all(directory).map_err(|e| format!("Could not create installer folder: {e}"))?;
-    fs::write(directory.join("devcon.exe"), DEVCON).map_err(|e| e.to_string())?;
-    fs::write(directory.join("MttVDD.inf"), DRIVER_INF).map_err(|e| e.to_string())?;
-    fs::write(directory.join("mttvdd.cat"), DRIVER_CAT).map_err(|e| e.to_string())?;
-    fs::write(directory.join("MttVDD.dll"), DRIVER_DLL).map_err(|e| e.to_string())?;
-    fs::create_dir_all(VDD_DIR).map_err(|e| format!("Could not create {VDD_DIR}: {e}"))?;
-    fs::write(VDD_SETTINGS_PATH, SETTINGS_XML)
-        .map_err(|e| format!("Could not write display settings: {e}"))?;
-    Ok(directory.join("devcon.exe"))
-}
-
-fn perform_install() -> Result<(), String> {
-    let directory = std::env::temp_dir().join("CorsairEliteDisplayDriver-1.0");
-    let devcon = write_payload(&directory)?;
-    let status = Command::new(devcon)
-        .current_dir(&directory)
-        .args(["install", "MttVDD.inf", r"Root\MttVDD"])
-        .status()
-        .map_err(|e| format!("Could not run the driver installer: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "The virtual display driver installer returned {status}"
-        ));
+    pub fn spawn_watchdog() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let _ = Command::new(exe)
+            .args(["--display-watchdog", &std::process::id().to_string()])
+            .spawn();
     }
-    let _ = Command::new("DisplaySwitch.exe").arg("/extend").status();
-    Ok(())
 }
 
-pub fn install_embedded_driver() {
-    let result = perform_install();
-    let (message, title, flags) = match result {
-        Ok(()) => (
-            "The 480x480 virtual display was installed. Windows has been switched to Extend mode.",
-            "Corsair Elite Display",
-            MB_OK | MB_ICONINFORMATION,
-        ),
-        Err(ref error) => (
-            error.as_str(),
-            "Driver installation failed",
-            MB_OK | MB_ICONERROR,
-        ),
-    };
-    let message = wide(message);
-    let title = wide(title);
-    unsafe {
-        MessageBoxW(null_mut(), message.as_ptr(), title.as_ptr(), flags);
+pub fn run_watchdog(parent_pid: u32) {
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
+    if !handle.is_null() {
+        unsafe { WaitForSingleObject(handle, u32::MAX) };
+        unsafe { CloseHandle(handle) };
+    }
+    for _ in 0..10 {
+        if display_switch("/internal").is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
     }
 }

@@ -337,10 +337,17 @@ impl StreamController {
     }
 
     pub fn set_running(&self, running: bool) {
-        self.running.store(running, Ordering::Release);
-    }
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
+        let changed = self.running.swap(running, Ordering::AcqRel) != running;
+        if changed && let Ok(mut current) = self.stats.lock() {
+            current.fps = 0.0;
+            current.latency_ms = 0.0;
+            current.frame_bytes = 0;
+            current.status = if running {
+                "Preparing the 480×480 second screen…".into()
+            } else {
+                "Off · cooler hardware screen active".into()
+            };
+        }
     }
     pub fn update_settings(&self, settings: Settings) {
         if let Ok(mut current) = self.settings.lock() {
@@ -426,17 +433,25 @@ fn stream_loop(
         }
         let selected = monitors
             .iter()
-            .find(|m| m.device_name == config.monitor)
+            .find(|monitor| {
+                monitor.device_name == config.monitor
+                    && monitor.width() == LCD_SIZE
+                    && monitor.height() == LCD_SIZE
+                    && !monitor.primary
+            })
+            .or_else(|| {
+                monitors.iter().find(|monitor| {
+                    monitor.width() == LCD_SIZE && monitor.height() == LCD_SIZE && !monitor.primary
+                })
+            })
             .or_else(|| {
                 monitors
                     .iter()
-                    .find(|m| m.width() == LCD_SIZE && m.height() == LCD_SIZE)
-            })
-            .or_else(|| monitors.iter().find(|m| !m.primary))
-            .or_else(|| monitors.first());
+                    .find(|monitor| monitor.width() == LCD_SIZE && monitor.height() == LCD_SIZE)
+            });
         let Some(monitor) = selected else {
-            set_status(&stats, "No active Windows display found");
-            thread::sleep(Duration::from_secs(1));
+            set_status(&stats, "Preparing the 480×480 second screen…");
+            thread::sleep(Duration::from_millis(250));
             continue;
         };
 

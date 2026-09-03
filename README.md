@@ -4,7 +4,7 @@
   <img src="assets/icon-on.png" alt="Corsair Elite Display" width="128">
 </p>
 
-**Turn a Corsair Elite LCD cooler into a real 480×480 second Windows screen.** One small native EXE, no iCUE, no runtime, no bloat.
+**Turn a Corsair Elite LCD cooler into a real 480×480 second Windows screen.** One small native background app, no iCUE, no bundled runtime, no bloat.
 
 Move any window onto the virtual display and it appears on the cooler at up to the panel's native 30 FPS.
 
@@ -14,22 +14,31 @@ Move any window onto the virtual display and it appears on the cooler at up to t
 - **Low-latency streaming** — latest-frame-only capture with no buffering or stale-frame queue
 - **Native 30 FPS** — matches the LCD's maximum refresh rate
 - **Flicker-free capture** — the mouse cursor is intentionally excluded from the captured image
-- **Tiny background app** — native Win32 UI and notification-area icon; no Electron, WebView, .NET, Python, or bundled runtime
-- **One-file release** — the signed virtual-display driver and installer are embedded in the EXE
+- **Tray-only background app** — no main window; every setting lives in the notification-area menu
+- **Tiny native EXE** — no Electron, WebView, .NET, Python, installer, or bundled runtime
+- **Runtime-only monitor** — the 480×480 Windows display exists only while the app is open and switched on
 - **Hardware hand-off** — switching off or exiting releases the LCD so its saved hardware screen resumes
 - **Starts with Windows** — optional per-user startup toggle
 - **Automatic reconnect** — waits quietly and reconnects if the cooler is unplugged or temporarily unavailable
-- **Useful controls only** — display, frame rate, JPEG quality, brightness, and rotation
+- **Useful controls only** — on/off, frame rate, JPEG quality, brightness, rotation, and startup
 
 ## Quick Start
 
 1. Download `corsair-elite-display-v1.0.0-windows-x64.exe` from [Releases](../../releases/latest).
-2. Run it and choose **Install virtual display…** once.
-3. Accept the Windows administrator prompt.
-4. In Windows Display settings, keep the new 480×480 display in **Extend** mode.
-5. Choose that display in Corsair Elite Display and move any window onto it.
+2. Run it.
+3. Move any window onto the 480×480 display.
 
-The app stays in the Windows notification area when its window is closed. Left-click the cooler icon to reopen it, or right-click it to turn streaming on/off, control startup, or exit.
+Turning the app off removes that display immediately. Exiting—or even terminating the
+app unexpectedly—also removes it through a tiny watchdog process. The detached Windows
+display layout is saved per user, so a power interruption cannot make the screen return
+by itself at the next boot.
+
+The app has no main window. Right-click the cooler icon in the Windows notification area to turn the second screen on/off or change any setting.
+
+> [!IMPORTANT]
+> The app never installs or changes drivers and never requests administrator access. It uses
+> the signed virtual-display target already available on this PC and changes its Windows
+> desktop mode only while the app is running and switched on.
 
 > [!NOTE]
 > Corsair iCUE may claim exclusive access to the LCD. Close iCUE if the app reports that the cooler is unavailable. Fan, pump, and RGB control remain with the cooler hardware or your existing controller software.
@@ -60,7 +69,7 @@ Install the stable Rust toolchain and a current Windows SDK, then run:
 cargo build --release
 ```
 
-The standalone executable is created at `target\release\corsair-elite-display.exe`. The Windows icon and the virtual-display driver are compiled into it.
+The standalone executable is created at `target\release\corsair-elite-display.exe`.
 
 ## How It Works
 
@@ -74,7 +83,7 @@ Corsair HID image packets
 Cooler LCD (480×480 at up to 30 Hz)
 ```
 
-Settings are stored in `%APPDATA%\CorsairEliteDisplay\settings.ini`. Enabling startup adds only the current EXE to the standard per-user Windows startup entry.
+Settings are stored in `%APPDATA%\CorsairEliteDisplay\settings.ini`. Enabling startup adds only the current EXE to the standard per-user Windows startup entry. The monitor is enabled and disabled with Windows' built-in per-user display switching, so runtime use needs no administrator access.
 
 ## Known Limitations
 
@@ -85,9 +94,6 @@ Settings are stored in `%APPDATA%\CorsairEliteDisplay\settings.ini`. Enabling st
 ## Acknowledgments
 
 - The Corsair LCD JPEG packet format was independently documented by the open-source hardware community.
-- The embedded virtual display is based on the signed MttVDD driver.
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled-component attribution.
 
 ## License
 

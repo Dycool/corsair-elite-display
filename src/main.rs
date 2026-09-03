@@ -19,7 +19,8 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 fn main() {
-    if std::env::args().any(|arg| arg == "--self-test") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--self-test") {
         std::process::exit(match capture::self_test() {
             Ok(()) => 0,
             Err(error) => {
@@ -32,8 +33,10 @@ fn main() {
         });
     }
 
-    if std::env::args().any(|arg| arg == "--install-driver") {
-        virtual_display::install_embedded_driver();
+    if let Some(index) = args.iter().position(|arg| arg == "--display-watchdog") {
+        if let Some(parent_pid) = args.get(index + 1).and_then(|value| value.parse().ok()) {
+            virtual_display::run_watchdog(parent_pid);
+        }
         return;
     }
 
@@ -53,6 +56,7 @@ fn main() {
         return;
     }
 
-    app::run(std::env::args().any(|arg| arg == "--background"));
+    virtual_display::VirtualDisplayManager::spawn_watchdog();
+    app::run(args.iter().any(|arg| arg == "--background"));
     unsafe { CloseHandle(mutex) };
 }

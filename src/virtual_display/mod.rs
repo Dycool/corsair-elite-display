@@ -1,2 +1,2 @@
 pub mod manager;
-pub use manager::{VirtualDisplayManager, install_embedded_driver};
+pub use manager::{VirtualDisplayManager, run_watchdog};
