@@ -34,7 +34,7 @@ fn main() {
     }
 
     // Strict single-instance guard: acquire mutex with initial ownership requested
-    let mutex_name = wide("Local\\CorsairEliteDisplay.SingleInstance");
+    let mutex_name = wide("CorsairEliteDisplay_SingleInstance");
     let mutex = unsafe { CreateMutexW(null_mut(), 1, mutex_name.as_ptr()) };
     let last_error = unsafe { GetLastError() };
 
