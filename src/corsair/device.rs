@@ -223,6 +223,8 @@ impl CorsairLcdDevice {
                     handle,
                     product_name,
                 };
+                // Open software streaming session (official Corsair iCUE protocol)
+                let _ = device.send_session_control(true);
                 return Ok(device);
             }
             last_error = unsafe { GetLastError() };
@@ -324,10 +326,43 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    /// Releases software ownership of the LCD.
-    /// The cooler microcontroller resumes its saved hardware screen as soon as the handle is closed.
-    /// We do NOT send any reset or clear opcodes, ensuring the onboard hardware image remains intact.
+    /// Sends session control report to Corsair LCD microcontroller:
+    /// 0x01 = open software streaming session
+    /// 0x00 = close software session and return to hardware mode
+    pub fn send_session_control(&self, open: bool) -> Result<(), String> {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x1D; // Opcode: Device Session Control (official Corsair cc021 driver protocol)
+        packet[2] = if open { 0x01 } else { 0x00 };
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (session_control) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commands microcontroller to immediately resume playing the stored customized animation/image
+    pub fn trigger_hardware_animation(&self) -> Result<(), String> {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x16; // Opcode: Play Customized Animation (official Corsair cc021 driver protocol)
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (play_animation) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases software ownership of the LCD and restores the cooler's hardware image/GIF.
     pub fn release_to_hardware(self) {
+        // Trigger hardware animation playback
+        let _ = self.trigger_hardware_animation();
+        // Close software streaming session, returning display to hardware configuration
+        let _ = self.send_session_control(false);
         drop(self);
     }
 }
