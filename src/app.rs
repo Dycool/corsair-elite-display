@@ -25,6 +25,7 @@ const MENU_TOGGLE: usize = 200;
 const MENU_STARTUP: usize = 201;
 const MENU_EXIT: usize = 202;
 const MENU_SHOW_MOUSE: usize = 203;
+const MENU_CONFIGURE_VDD: usize = 204;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
@@ -87,6 +88,15 @@ impl AppState {
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
+        let _ = VirtualDisplayManager::ensure_configured();
+        if !VirtualDisplayManager::is_driver_installed() && !VirtualDisplayManager::is_admin() {
+            let msg = wide("Corsair Elite Display requires Administrator privileges to set up the Virtual Screen driver for the first time.\n\nPlease close this instance and run the application as Administrator.");
+            let title = wide("Administrator Privileges Required");
+            unsafe {
+                MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+            }
+        }
+
         if self.settings.streaming {
             if let Err(error) = VirtualDisplayManager::activate() {
                 self.settings.streaming = false;
@@ -129,7 +139,15 @@ impl AppState {
             VirtualDisplayManager::deactivate();
             self.save();
         } else if let Err(error) = VirtualDisplayManager::activate() {
-            show_error(self.hwnd, &error);
+            if !VirtualDisplayManager::is_admin() && !VirtualDisplayManager::is_driver_installed() {
+                let msg = wide("Administrator privileges are required to install and configure the Virtual Screen driver.\n\nPlease run Corsair Elite Display as Administrator.");
+                let title = wide("Administrator Privileges Required");
+                unsafe {
+                    MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                }
+            } else {
+                show_error(self.hwnd, &error);
+            }
         } else {
             self.settings.streaming = true;
             self.apply();
@@ -264,11 +282,7 @@ impl AppState {
                 );
             }
             for (index, value) in FPS_VALUES.iter().enumerate() {
-                let label = if *value == 30 {
-                    "30 FPS (Hardware Max)".to_string()
-                } else {
-                    format!("{value} FPS")
-                };
+                let label = format!("{value} FPS");
                 append_checked(
                     fps,
                     MENU_FPS_BASE + index,
@@ -307,6 +321,7 @@ impl AppState {
             append_submenu(menu, view, "View");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_checked(menu, MENU_STARTUP, "Start with Windows", startup_enabled());
+            append_menu(menu, MENU_CONFIGURE_VDD, "Configure Virtual Screen...");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_menu(menu, MENU_EXIT, "Exit");
 
@@ -334,6 +349,24 @@ impl AppState {
                 MENU_STARTUP => {
                     if let Err(error) = set_startup(!startup_enabled()) {
                         show_error(self.hwnd, &error);
+                    }
+                }
+                MENU_CONFIGURE_VDD => {
+                    if !VirtualDisplayManager::is_admin() {
+                        let msg = wide("Administrator privileges are required to configure and install the Virtual Screen driver.\n\nPlease close Corsair Elite Display, right-click the application, and select 'Run as administrator'.");
+                        let title = wide("Administrator Privileges Required");
+                        MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    } else {
+                        match VirtualDisplayManager::configure_and_restart() {
+                            Ok(()) => {
+                                let msg = wide("The Corsair LCD Virtual Screen has been successfully configured and activated!\n\nWindows will now identify the display as 'Corsair LCD'.");
+                                let title = wide("Virtual Screen Configured");
+                                MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                            }
+                            Err(e) => {
+                                show_error(self.hwnd, &e);
+                            }
+                        }
                     }
                 }
                 MENU_EXIT => {

@@ -2,8 +2,6 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::ptr::null_mut;
 
-use image::ExtendedColorType;
-
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
@@ -13,6 +11,17 @@ const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_
 
 const GUID_DEVINTERFACE_HID: [u8; 16] = [
     0xb2, 0x55, 0x1e, 0x4d, 0x6f, 0xf1, 0xcf, 0x11, 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30,
+];
+
+const SUPPORTED_PIDS: &[&str] = &[
+    "PID_0C39", // Corsair Commander Core LCD Cap (Elite Capellix LCD)
+    "PID_0C33", // Corsair Elite LCD XT Cap
+    "PID_0C42", // Corsair Nautilus LCD Cap / Capellix XT LCD
+    "PID_0C4E", // Corsair iCUE LINK AIO LCD Screen Module (Titan, H100i/H150i/H170i LINK)
+    "PID_0C37", // Corsair H100i/H150i/H170i ELITE LCD / RGB
+    "PID_0C40", // Corsair iCUE LINK System Hub LCD
+    "PID_0C53", // Corsair iCUE LINK XD5 LCD / Reservoir
+    "PID_0C5B", // Corsair LCD Module
 ];
 
 #[link(name = "cfgmgr32")]
@@ -64,6 +73,12 @@ unsafe extern "system" {
         ReportBuffer: *const u8,
         ReportBufferLength: u32,
     ) -> u8;
+
+    fn HidD_GetProductString(
+        HidDeviceObject: *mut std::ffi::c_void,
+        Buffer: *mut u16,
+        BufferLength: u32,
+    ) -> u8;
 }
 
 fn to_u16_vec(s: &str) -> Vec<u16> {
@@ -71,6 +86,33 @@ fn to_u16_vec(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn query_product_string(path: &str) -> Option<String> {
+    let path_u16 = to_u16_vec(path);
+    let handle = unsafe {
+        CreateFileW(
+            path_u16.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut buf = [0u16; 256];
+    let ok = unsafe { HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32) };
+    unsafe { CloseHandle(handle); }
+    if ok != 0 {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +131,8 @@ fn frame_packet(chunk: &[u8], part_num: u16, is_end: bool) -> [u8; 1024] {
 
 pub struct CorsairLcdDevice {
     handle: *mut std::ffi::c_void,
+    #[allow(dead_code)]
+    product_name: String,
 }
 
 unsafe impl Send for CorsairLcdDevice {}
@@ -96,7 +140,6 @@ unsafe impl Sync for CorsairLcdDevice {}
 
 impl CorsairLcdDevice {
     fn find_device_paths() -> Vec<String> {
-        let supported_pids = ["PID_0C39", "PID_0C33", "PID_0C4E", "PID_0C42"];
         let mut matches = Vec::new();
         unsafe {
             let mut len = 0u32;
@@ -130,10 +173,14 @@ impl CorsairLcdDevice {
                             .to_string_lossy()
                             .to_string();
                         let upper = s.to_uppercase();
-                        if upper.contains("VID_1B1C")
-                            && supported_pids.iter().any(|pid| upper.contains(pid))
-                        {
-                            matches.push(s);
+                        if upper.contains("VID_1B1C") {
+                            if SUPPORTED_PIDS.iter().any(|pid| upper.contains(pid)) {
+                                matches.push(s);
+                            } else if let Some(product_name) = query_product_string(&s) {
+                                if product_name.to_uppercase().contains("LCD") {
+                                    matches.push(s);
+                                }
+                            }
                         }
                     }
                     start = i + 1;
@@ -149,8 +196,8 @@ impl CorsairLcdDevice {
             return Err("Waiting for a supported Corsair LCD...".to_string());
         }
         let mut last_error = 0;
-        for path in paths {
-            let path_u16 = to_u16_vec(&path);
+        for path in &paths {
+            let path_u16 = to_u16_vec(path);
             let handle = unsafe {
                 CreateFileW(
                     path_u16.as_ptr(),
@@ -163,13 +210,60 @@ impl CorsairLcdDevice {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                return Ok(Self { handle });
+                let mut buf = [0u16; 256];
+                let ok = unsafe { HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32) };
+                let product_name = if ok != 0 {
+                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    String::from_utf16_lossy(&buf[..len])
+                } else {
+                    "Corsair Elite LCD".to_string()
+                };
+
+                let device = Self {
+                    handle,
+                    product_name,
+                };
+                // Switch to software streaming mode
+                let _ = device.set_hardware_mode(false);
+                return Ok(device);
             }
             last_error = unsafe { GetLastError() };
         }
         Err(format!(
             "Corsair LCD found but unavailable (Windows error {last_error}). Close iCUE if it is using the screen."
         ))
+    }
+
+    #[allow(dead_code)]
+    pub fn product_name(&self) -> &str {
+        &self.product_name
+    }
+
+    pub fn set_hardware_mode(&self, enabled: bool) -> Result<(), String> {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x1B; // Opcode: Set Hardware Mode
+        packet[2] = if enabled { 0x01 } else { 0x00 };
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (set_hardware_mode) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enter_hardware_mode(&self) -> Result<(), String> {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x1E; // Opcode: Enter Hardware Mode
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (enter_hardware_mode) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
     }
 
     pub fn set_brightness(&self, percent: u8) -> Result<(), String> {
@@ -184,6 +278,7 @@ impl CorsairLcdDevice {
         packet[0] = 0x03; // Report ID
         packet[1] = 0x0B; // Opcode: LCD Brightness
         packet[2] = raw_val;
+        packet[3] = 0x01;
         unsafe {
             let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
             if res == 0 {
@@ -193,23 +288,26 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    pub fn clear_screen(&self) -> Result<(), String> {
-        let black_pixels = vec![0u8; 480 * 480 * 3];
-        let mut jpeg = Vec::with_capacity(8 * 1024);
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 60)
-            .encode(
-                &black_pixels,
-                480,
-                480,
-                ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| format!("JPEG blank frame encoding failed: {e}"))?;
-        self.send_frame(&jpeg)
-    }
-
-    pub fn turn_off(&self) {
-        let _ = self.clear_screen();
-        let _ = self.set_brightness(0);
+    #[allow(dead_code)]
+    pub fn set_rotation(&self, angle: u16) -> Result<(), String> {
+        let raw_val = match angle {
+            0 => 0x00,
+            90 => 0x01,
+            180 => 0x02,
+            270 => 0x03,
+            _ => return Err(format!("Unsupported rotation angle: {}", angle)),
+        };
+        let mut packet = [0u8; 32];
+        packet[0] = 0x03; // Report ID
+        packet[1] = 0x0C; // Opcode: LCD Rotation
+        packet[2] = raw_val;
+        unsafe {
+            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                return Err(format!("HidD_SetFeature (rotation) failed: {}", GetLastError()));
+            }
+        }
+        Ok(())
     }
 
     pub fn send_frame(&self, jpeg_data: &[u8]) -> Result<(), String> {
@@ -255,10 +353,14 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    /// Stops software ownership of the LCD. Clears any residual frame and shuts
-    /// down backlight power before closing the HID handle.
-    pub fn release_to_hardware(self) {
-        self.turn_off();
+    /// Releases software ownership of the LCD and commands the device
+    /// to resume its hardware configuration (image / GIF / sensor screen).
+    pub fn release_to_hardware(self, active_brightness: u8) {
+        // Restore operating brightness so the hardware screen is clearly visible
+        let _ = self.set_brightness(active_brightness.max(50));
+        // Tell the microcontroller to transition to hardware mode
+        let _ = self.set_hardware_mode(true);
+        let _ = self.enter_hardware_mode();
         drop(self);
     }
 }

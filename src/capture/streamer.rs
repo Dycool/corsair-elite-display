@@ -63,16 +63,18 @@ unsafe extern "system" fn enum_monitor(
         let name = String::from_utf16_lossy(&info.szDevice[..end]);
         let rect = info.monitorInfo.rcMonitor;
         let primary = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
-        let suffix = if primary { " (Primary)" } else { "" };
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let is_virtual_cooler = width == LCD_SIZE && height == LCD_SIZE && !primary;
+        let label = if is_virtual_cooler {
+            format!("Corsair Elite LCD ({width}x{height})")
+        } else {
+            let suffix = if primary { " (Primary)" } else { "" };
+            format!("{name} - {width}x{height}{suffix}")
+        };
         list.push(MonitorInfo {
             device_name: name.clone(),
-            label: format!(
-                "{} - {}x{}{}",
-                name,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                suffix
-            ),
+            label,
             rect,
             primary,
         });
@@ -612,7 +614,8 @@ fn stream_loop(
 
         if !is_running {
             if let Some(connected) = device.take() {
-                connected.release_to_hardware();
+                let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
+                connected.release_to_hardware(config.brightness);
             }
             capture.reset_source();
             prev_pixels.clear();
@@ -825,6 +828,7 @@ fn stream_loop(
     }
 
     if let Some(connected) = device.take() {
-        connected.release_to_hardware();
+        let config = settings.lock().map(|s| s.clone()).unwrap_or_default();
+        connected.release_to_hardware(config.brightness);
     }
 }
