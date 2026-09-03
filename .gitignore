@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 *.exe
+!Dependencies/devcon.exe
 *.pdb
 .vscode/
 .idea/

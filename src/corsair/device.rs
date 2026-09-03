@@ -55,31 +55,34 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
 }
 
-#[link(name = "hid")]
-unsafe extern "system" {
-    fn HidD_SetFeature(
-        HidDeviceObject: *mut std::ffi::c_void,
-        ReportBuffer: *const u8,
-        ReportBufferLength: u32,
-    ) -> u8;
-}
-
 fn to_u16_vec(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
-#[allow(dead_code)]
+fn frame_packet(chunk: &[u8], part_num: u16, is_end: bool) -> [u8; 1024] {
+    debug_assert!(chunk.len() <= 1016);
+    let mut packet = [0u8; 1024];
+    packet[0] = 0x02;
+    packet[1] = 0x05;
+    packet[2] = 0x40;
+    packet[3] = u8::from(is_end);
+    packet[4..6].copy_from_slice(&part_num.to_le_bytes());
+    packet[6..8].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+    packet[8..8 + chunk.len()].copy_from_slice(chunk);
+    packet
+}
+
 pub struct CorsairLcdDevice {
     handle: *mut std::ffi::c_void,
-    pub path: String,
 }
 
-unsafe impl Send for CorsairLcdDevice {}
-unsafe impl Sync for CorsairLcdDevice {}
-
 impl CorsairLcdDevice {
-    pub fn find_device_path() -> Option<String> {
-        let supported_pids = ["0C39", "0C33", "0C4E", "0C42"];
+    fn find_device_paths() -> Vec<String> {
+        let supported_pids = ["PID_0C39", "PID_0C33", "PID_0C4E", "PID_0C42"];
+        let mut matches = Vec::new();
         unsafe {
             let mut len = 0u32;
             let res = CM_Get_Device_Interface_List_SizeW(
@@ -89,7 +92,7 @@ impl CorsairLcdDevice {
                 0,
             );
             if res != 0 || len == 0 {
-                return None;
+                return matches;
             }
 
             let mut buffer = vec![0u16; len as usize];
@@ -101,103 +104,64 @@ impl CorsairLcdDevice {
                 0,
             );
             if res != 0 {
-                return None;
+                return matches;
             }
 
             let mut start = 0;
             for i in 0..buffer.len() {
                 if buffer[i] == 0 {
                     if start < i {
-                        let s = OsString::from_wide(&buffer[start..i]).to_string_lossy().to_string();
+                        let s = OsString::from_wide(&buffer[start..i])
+                            .to_string_lossy()
+                            .to_string();
                         let upper = s.to_uppercase();
-                        if upper.contains("VID_1B1C") && supported_pids.iter().any(|pid| upper.contains(pid)) {
-                            return Some(s);
+                        if upper.contains("VID_1B1C")
+                            && supported_pids.iter().any(|pid| upper.contains(pid))
+                        {
+                            matches.push(s);
                         }
                     }
                     start = i + 1;
                 }
             }
         }
-        None
+        matches
     }
 
     pub fn open() -> Result<Self, String> {
-        let path = Self::find_device_path()
-            .ok_or_else(|| "No supported Corsair LCD device found via PnP".to_string())?;
-
-        let path_u16 = to_u16_vec(&path);
-        let handle = unsafe {
-            CreateFileW(
-                path_u16.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
-        };
-
-        if handle == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() };
-            return Err(format!("Failed to open device handle (Win32 error {})", err));
+        let paths = Self::find_device_paths();
+        if paths.is_empty() {
+            return Err("Waiting for a supported Corsair LCD…".to_string());
         }
-
-        Ok(Self { handle, path })
-    }
-
-    pub fn set_brightness(&self, percent: u8) -> Result<(), String> {
-        let raw_val = match percent {
-            0..=16 => 0x01,
-            17..=49 => 0x04,
-            50..=83 => 0x10,
-            _ => 0x40,
-        };
-
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x0B; // Opcode
-        packet[2] = raw_val;
-
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (brightness) failed: {}", GetLastError()));
+        let mut last_error = 0;
+        for path in paths {
+            let path_u16 = to_u16_vec(&path);
+            let handle = unsafe {
+                CreateFileW(
+                    path_u16.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                return Ok(Self { handle });
             }
+            last_error = unsafe { GetLastError() };
         }
-        Ok(())
-    }
-
-    pub fn set_rotation(&self, angle: u16) -> Result<(), String> {
-        let raw_val = match angle {
-            0 => 0x00,
-            90 => 0x01,
-            180 => 0x02,
-            270 => 0x03,
-            _ => return Err(format!("Unsupported rotation angle: {}", angle)),
-        };
-
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x0C; // Opcode
-        packet[2] = raw_val;
-
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (rotation) failed: {}", GetLastError()));
-            }
-        }
-        Ok(())
+        Err(format!(
+            "Corsair LCD found but unavailable (Windows error {last_error}). Close iCUE if it is using the screen."
+        ))
     }
 
     pub fn send_frame(&self, jpeg_data: &[u8]) -> Result<(), String> {
         let max_len = 1024;
         let header_size = 8;
         let real_max_len = max_len - header_size;
-        let mut part_num: u16 = 0;
-
-        for chunk in jpeg_data.chunks(real_max_len) {
+        for (part_num, chunk) in (0_u16..).zip(jpeg_data.chunks(real_max_len)) {
             let chunk_len = chunk.len();
             let is_end = if (part_num as usize * real_max_len) + chunk_len >= jpeg_data.len() {
                 1u8
@@ -205,18 +169,7 @@ impl CorsairLcdDevice {
                 0u8
             };
 
-            let mut packet = Vec::with_capacity(max_len);
-            packet.push(0x02); // Opcode IMG_TX
-            packet.push(0x05);
-            packet.push(0x40);
-            packet.push(is_end);
-            packet.extend_from_slice(&part_num.to_le_bytes());
-            packet.extend_from_slice(&(chunk_len as u16).to_le_bytes());
-            packet.extend_from_slice(chunk);
-
-            if packet.len() < max_len {
-                packet.resize(max_len, 0x00);
-            }
+            let packet = frame_packet(chunk, part_num, is_end != 0);
 
             unsafe {
                 let mut written = 0u32;
@@ -227,16 +180,20 @@ impl CorsairLcdDevice {
                     &mut written,
                     null_mut(),
                 );
-                if success == 0 {
+                if success == 0 || written != packet.len() as u32 {
                     let err = GetLastError();
                     return Err(format!("WriteFile failed with error {}", err));
                 }
             }
-
-            part_num += 1;
         }
 
         Ok(())
+    }
+
+    /// Stops software ownership of the LCD. The cap firmware resumes its saved
+    /// hardware screen as soon as the HID handle is released.
+    pub fn release_to_hardware(self) {
+        drop(self);
     }
 }
 
@@ -248,5 +205,18 @@ impl Drop for CorsairLcdDevice {
             }
             self.handle = INVALID_HANDLE_VALUE;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_packet;
+
+    #[test]
+    fn image_packet_has_the_observed_corsair_header_and_padding() {
+        let packet = frame_packet(&[0xff, 0xd8, 0xff], 7, true);
+        assert_eq!(&packet[..8], &[0x02, 0x05, 0x40, 0x01, 7, 0, 3, 0]);
+        assert_eq!(&packet[8..11], &[0xff, 0xd8, 0xff]);
+        assert!(packet[11..].iter().all(|byte| *byte == 0));
     }
 }

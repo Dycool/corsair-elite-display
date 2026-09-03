@@ -1,32 +1,58 @@
+#![windows_subsystem = "windows"]
+
+mod app;
 mod capture;
 mod corsair;
-mod ui;
+mod settings;
 mod virtual_display;
 
-use eframe::egui;
-use ui::EliteDisplayApp;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::ptr::{null, null_mut};
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 420.0])
-            .with_resizable(false)
-            .with_maximize_button(false)
-            .with_title("Corsair Elite LCD - Second Display"),
-        ..Default::default()
-    };
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_APP};
 
-    println!("Starting Corsair Elite LCD Display App...");
-    let res = eframe::run_native(
-        "Corsair Elite LCD - Second Display",
-        options,
-        Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(EliteDisplayApp::new(cc)))
-        }),
-    );
-    if let Err(ref e) = res {
-        eprintln!("run_native error: {:?}", e);
+fn wide(value: &str) -> Vec<u16> {
+    OsStr::new(value).encode_wide().chain(Some(0)).collect()
+}
+
+fn main() {
+    if std::env::args().any(|arg| arg == "--self-test") {
+        std::process::exit(match capture::self_test() {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = std::fs::write(
+                    std::env::temp_dir().join("corsair-elite-display-self-test.txt"),
+                    error,
+                );
+                1
+            }
+        });
     }
-    res
+
+    if std::env::args().any(|arg| arg == "--install-driver") {
+        virtual_display::install_embedded_driver();
+        return;
+    }
+
+    let mutex_name = wide("Local\\CorsairEliteDisplay.SingleInstance");
+    let mutex = unsafe { CreateMutexW(null_mut(), 0, mutex_name.as_ptr()) };
+    if mutex.is_null() {
+        return;
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let class_name = wide(app::WINDOW_CLASS);
+        let existing = unsafe { FindWindowW(class_name.as_ptr(), null()) };
+        if !existing.is_null() {
+            unsafe { PostMessageW(existing, WM_APP + 2, 0, 0) };
+        }
+        unsafe { CloseHandle(mutex) };
+        return;
+    }
+
+    app::run(std::env::args().any(|arg| arg == "--background"));
+    unsafe { CloseHandle(mutex) };
 }
