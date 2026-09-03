@@ -2,6 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::ptr::null_mut;
 
+use image::ExtendedColorType;
+
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
@@ -23,6 +25,10 @@ const SUPPORTED_PIDS: &[&str] = &[
     "PID_0C53", // Corsair iCUE LINK XD5 LCD / Reservoir
     "PID_0C5B", // Corsair LCD Module
 ];
+
+// Commander Core variants used by Elite Capellix / Elite LCD AIOs.
+// OpenLinkHub maps decimal PIDs 3100 and 3122 to the same Commander Core protocol.
+const COMMANDER_CORE_PIDS: &[&str] = &["PID_0C1C", "PID_0C32"];
 
 #[link(name = "cfgmgr32")]
 unsafe extern "system" {
@@ -106,13 +112,134 @@ fn query_product_string(path: &str) -> Option<String> {
     }
     let mut buf = [0u16; 256];
     let ok = unsafe { HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32) };
-    unsafe { CloseHandle(handle); }
+    unsafe {
+        CloseHandle(handle);
+    }
     if ok != 0 {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..len]))
     } else {
         None
     }
+}
+
+fn enumerate_hid_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    unsafe {
+        let mut len = 0u32;
+        let res = CM_Get_Device_Interface_List_SizeW(
+            &mut len,
+            GUID_DEVINTERFACE_HID.as_ptr(),
+            null_mut(),
+            0,
+        );
+        if res != 0 || len == 0 {
+            return paths;
+        }
+
+        let mut buffer = vec![0u16; len as usize];
+        let res = CM_Get_Device_Interface_ListW(
+            GUID_DEVINTERFACE_HID.as_ptr(),
+            null_mut(),
+            buffer.as_mut_ptr(),
+            len,
+            0,
+        );
+        if res != 0 {
+            return paths;
+        }
+
+        let mut start = 0;
+        for i in 0..buffer.len() {
+            if buffer[i] == 0 {
+                if start < i {
+                    paths.push(
+                        OsString::from_wide(&buffer[start..i])
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+                start = i + 1;
+            }
+        }
+    }
+    paths
+}
+
+fn commander_hardware_mode_packet() -> [u8; 65] {
+    // Exact Commander Core transport used by OpenLinkHub:
+    // report-id 0x00, protocol prefix 0x08, command 01 03 00 01 (hardware mode).
+    let mut packet = [0u8; 65];
+    packet[1] = 0x08;
+    packet[2..6].copy_from_slice(&[0x01, 0x03, 0x00, 0x01]);
+    packet
+}
+
+fn request_commander_core_hardware_mode() -> Result<(), String> {
+    let mut paths: Vec<String> = enumerate_hid_paths()
+        .into_iter()
+        .filter(|path| {
+            let upper = path.to_uppercase();
+            upper.contains("VID_1B1C")
+                && COMMANDER_CORE_PIDS.iter().any(|pid| upper.contains(pid))
+        })
+        .collect();
+
+    // OpenLinkHub registers Commander Core on interface 0. Prefer MI_00 if Windows exposes
+    // multiple HID collections, but still fall back to the remaining matching paths.
+    paths.sort_by_key(|path| !path.to_uppercase().contains("MI_00"));
+
+    if paths.is_empty() {
+        return Err("Corsair Commander Core control interface was not found".into());
+    }
+
+    let packet = commander_hardware_mode_packet();
+    let mut last_error = 0u32;
+    for path in paths {
+        let path_u16 = to_u16_vec(&path);
+        let handle = unsafe {
+            CreateFileW(
+                path_u16.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            last_error = unsafe { GetLastError() };
+            continue;
+        }
+
+        let mut written = 0u32;
+        let success = unsafe {
+            WriteFile(
+                handle,
+                packet.as_ptr(),
+                packet.len() as u32,
+                &mut written,
+                null_mut(),
+            )
+        };
+        if success == 0 || written != packet.len() as u32 {
+            last_error = unsafe { GetLastError() };
+            unsafe {
+                CloseHandle(handle);
+            }
+            continue;
+        }
+
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "Commander Core hardware-mode request failed (Windows error {last_error})"
+    ))
 }
 
 #[cfg(test)]
@@ -141,49 +268,15 @@ unsafe impl Sync for CorsairLcdDevice {}
 impl CorsairLcdDevice {
     fn find_device_paths() -> Vec<String> {
         let mut matches = Vec::new();
-        unsafe {
-            let mut len = 0u32;
-            let res = CM_Get_Device_Interface_List_SizeW(
-                &mut len,
-                GUID_DEVINTERFACE_HID.as_ptr(),
-                null_mut(),
-                0,
-            );
-            if res != 0 || len == 0 {
-                return matches;
-            }
-
-            let mut buffer = vec![0u16; len as usize];
-            let res = CM_Get_Device_Interface_ListW(
-                GUID_DEVINTERFACE_HID.as_ptr(),
-                null_mut(),
-                buffer.as_mut_ptr(),
-                len,
-                0,
-            );
-            if res != 0 {
-                return matches;
-            }
-
-            let mut start = 0;
-            for i in 0..buffer.len() {
-                if buffer[i] == 0 {
-                    if start < i {
-                        let s = OsString::from_wide(&buffer[start..i])
-                            .to_string_lossy()
-                            .to_string();
-                        let upper = s.to_uppercase();
-                        if upper.contains("VID_1B1C") {
-                            if SUPPORTED_PIDS.iter().any(|pid| upper.contains(pid)) {
-                                matches.push(s);
-                            } else if let Some(product_name) = query_product_string(&s) {
-                                if product_name.to_uppercase().contains("LCD") {
-                                    matches.push(s);
-                                }
-                            }
-                        }
+        for path in enumerate_hid_paths() {
+            let upper = path.to_uppercase();
+            if upper.contains("VID_1B1C") {
+                if SUPPORTED_PIDS.iter().any(|pid| upper.contains(pid)) {
+                    matches.push(path);
+                } else if let Some(product_name) = query_product_string(&path) {
+                    if product_name.to_uppercase().contains("LCD") {
+                        matches.push(path);
                     }
-                    start = i + 1;
                 }
             }
         }
@@ -211,7 +304,9 @@ impl CorsairLcdDevice {
             };
             if handle != INVALID_HANDLE_VALUE {
                 let mut buf = [0u16; 256];
-                let ok = unsafe { HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32) };
+                let ok = unsafe {
+                    HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32)
+                };
                 let product_name = if ok != 0 {
                     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
                     String::from_utf16_lossy(&buf[..len])
@@ -219,13 +314,10 @@ impl CorsairLcdDevice {
                     "Corsair Elite LCD".to_string()
                 };
 
-                let device = Self {
+                return Ok(Self {
                     handle,
                     product_name,
-                };
-                // Open software streaming session (official Corsair iCUE protocol)
-                let _ = device.send_session_control(true);
-                return Ok(device);
+                });
             }
             last_error = unsafe { GetLastError() };
         }
@@ -255,7 +347,10 @@ impl CorsairLcdDevice {
         unsafe {
             let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
             if res == 0 {
-                return Err(format!("HidD_SetFeature (brightness) failed: {}", GetLastError()));
+                return Err(format!(
+                    "HidD_SetFeature (brightness) failed: {}",
+                    GetLastError()
+                ));
             }
         }
         Ok(())
@@ -277,7 +372,10 @@ impl CorsairLcdDevice {
         unsafe {
             let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
             if res == 0 {
-                return Err(format!("HidD_SetFeature (rotation) failed: {}", GetLastError()));
+                return Err(format!(
+                    "HidD_SetFeature (rotation) failed: {}",
+                    GetLastError()
+                ));
             }
         }
         Ok(())
@@ -326,44 +424,36 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    /// Sends session control report to Corsair LCD microcontroller:
-    /// 0x01 = open software streaming session
-    /// 0x00 = close software session and return to hardware mode
-    pub fn send_session_control(&self, open: bool) -> Result<(), String> {
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x1D; // Opcode: Device Session Control (official Corsair cc021 driver protocol)
-        packet[2] = if open { 0x01 } else { 0x00 };
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (session_control) failed: {}", GetLastError()));
-            }
-        }
-        Ok(())
+    fn send_black_fallback_frame(&self) -> Result<(), String> {
+        // Never leave a captured desktop frame frozen on the pump display while waiting for
+        // the cooler firmware to resume its saved hardware screen.
+        let black_pixels = vec![0u8; 480 * 480 * 3];
+        let mut jpeg = Vec::with_capacity(8 * 1024);
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 60)
+            .encode(&black_pixels, 480, 480, ExtendedColorType::Rgb8)
+            .map_err(|error| format!("JPEG black fallback encoding failed: {error}"))?;
+        self.send_frame(&jpeg)
     }
 
-    /// Commands microcontroller to immediately resume playing the stored customized animation/image
-    pub fn trigger_hardware_animation(&self) -> Result<(), String> {
-        let mut packet = [0u8; 32];
-        packet[0] = 0x03; // Report ID
-        packet[1] = 0x16; // Opcode: Play Customized Animation (official Corsair cc021 driver protocol)
-        unsafe {
-            let res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
-            if res == 0 {
-                return Err(format!("HidD_SetFeature (play_animation) failed: {}", GetLastError()));
-            }
-        }
-        Ok(())
-    }
-
-    /// Releases software ownership of the LCD and restores the cooler's hardware image/GIF.
+    /// Releases the LCD stream and asks the Commander Core to resume its saved hardware state.
+    /// A black frame is sent first so a failed/unsupported handoff never leaves the desktop frozen.
     pub fn release_to_hardware(self) {
-        // Trigger hardware animation playback
-        let _ = self.trigger_hardware_animation();
-        // Close software streaming session, returning display to hardware configuration
-        let _ = self.send_session_control(false);
+        let black_result = self.send_black_fallback_frame();
         drop(self);
+        let hardware_result = request_commander_core_hardware_mode();
+
+        let error = match (black_result, hardware_result) {
+            (Ok(()), Ok(())) => None,
+            (Err(black), Ok(())) => Some(black),
+            (Ok(()), Err(hardware)) => Some(hardware),
+            (Err(black), Err(hardware)) => Some(format!("{black}; {hardware}")),
+        };
+        if let Some(error) = error {
+            let _ = std::fs::write(
+                std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
+                error,
+            );
+        }
     }
 }
 
@@ -380,7 +470,7 @@ impl Drop for CorsairLcdDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::frame_packet;
+    use super::{commander_hardware_mode_packet, frame_packet};
 
     #[test]
     fn image_packet_has_the_observed_corsair_header_and_padding() {
@@ -388,5 +478,12 @@ mod tests {
         assert_eq!(&packet[..8], &[0x02, 0x05, 0x40, 0x01, 7, 0, 3, 0]);
         assert_eq!(&packet[8..11], &[0xff, 0xd8, 0xff]);
         assert!(packet[11..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn commander_core_hardware_mode_packet_matches_observed_protocol() {
+        let packet = commander_hardware_mode_packet();
+        assert_eq!(&packet[..6], &[0x00, 0x08, 0x01, 0x03, 0x00, 0x01]);
+        assert!(packet[6..].iter().all(|byte| *byte == 0));
     }
 }
