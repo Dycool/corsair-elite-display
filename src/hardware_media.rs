@@ -204,17 +204,31 @@ fn playback_loop(media: HardwareMedia, stop: Arc<AtomicBool>) {
 
 fn play_static(frame: &HardwareFrame, stop: &AtomicBool) {
     let mut last_error = String::new();
-    for _ in 0..30 {
-        if stop.load(Ordering::Acquire) {
-            return;
-        }
+    let mut successful_writes = 0u8;
+    let deadline = Instant::now() + Duration::from_secs(4);
+
+    // A frame may already have been in flight when the UI changed the stream
+    // flag to Off. Re-send the RAM-cached hardware image a few times during a
+    // short settling window so the OFF image is guaranteed to be the last
+    // completed presentation. These are ordinary volatile LCD frames, not flash
+    // writes, so this does not consume hardware flash endurance.
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
         match CorsairLcdDevice::open().and_then(|device| device.send_frame(frame.jpeg.as_ref())) {
-            Ok(()) => return,
-            Err(error) => last_error = error,
+            Ok(()) => {
+                successful_writes += 1;
+                if successful_writes >= 3 {
+                    return;
+                }
+                sleep_interruptible(stop, Duration::from_millis(125));
+            }
+            Err(error) => {
+                last_error = error;
+                sleep_interruptible(stop, Duration::from_millis(100));
+            }
         }
-        sleep_interruptible(stop, Duration::from_millis(100));
     }
-    if !last_error.is_empty() {
+
+    if successful_writes == 0 && !last_error.is_empty() {
         write_playback_error(&last_error);
     }
 }
