@@ -3,6 +3,8 @@
 mod app;
 mod capture;
 mod corsair;
+mod driver_admin;
+mod hardware_restore;
 mod settings;
 mod virtual_display;
 
@@ -20,6 +22,14 @@ fn wide(value: &str) -> Vec<u16> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Elevated driver administration is performed by this same executable.
+    // Handle it before the single-instance guard so the normal tray instance
+    // can remain open while Windows elevates a short-lived helper copy of us.
+    if let Some(exit_code) = driver_admin::handle_admin_helper(&args) {
+        std::process::exit(exit_code);
+    }
+
     if args.iter().any(|arg| arg == "--self-test") {
         std::process::exit(match capture::self_test() {
             Ok(()) => 0,
@@ -39,7 +49,7 @@ fn main() {
             || arg == "--off"
             || arg == "-hw"
     }) {
-        let result = corsair::CorsairLcdDevice::restore_hardware_mode();
+        let result = hardware_restore::restore_hardware_mode();
         let _ = std::fs::write(
             std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
             match &result {
@@ -73,7 +83,7 @@ fn main() {
 
     // Ensure virtual monitor is cleaned up and hardware mode restored on panic
     std::panic::set_hook(Box::new(|_| {
-        let _ = corsair::CorsairLcdDevice::restore_hardware_mode();
+        let _ = hardware_restore::restore_hardware_mode();
         virtual_display::VirtualDisplayManager::deactivate();
     }));
 
