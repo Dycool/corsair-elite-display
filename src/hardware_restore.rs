@@ -5,7 +5,7 @@ use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::Win32::System::LibraryLoader::{FreeLibrary, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
@@ -197,7 +197,7 @@ fn restore_persisted_with_icue(serial: Option<&str>) -> Result<(), String> {
         return Err("Corsair iCUE LCD DLL is not installed; using native HID restore only".into());
     }
 
-    let result = unsafe {
+    unsafe {
         let get_fn = |name: &[u8]| -> *mut c_void {
             GetProcAddress(module, name.as_ptr())
                 .map(|function| function as *mut c_void)
@@ -223,22 +223,18 @@ fn restore_persisted_with_icue(serial: Option<&str>) -> Result<(), String> {
             transmute(get_fn(b"iD_USB_play_boot_animation_cc021\0"));
 
         let Some(open) = open else {
-            FreeLibrary(module);
             return Err("Corsair LCD DLL is missing iD_USB_open_device_cc021".into());
         };
         let Some(set_hardware) = set_hardware else {
-            FreeLibrary(module);
             return Err("Corsair LCD DLL is missing iD_USB_set_hardware_mode_cc021".into());
         };
         let Some(enter_hardware) = enter_hardware else {
-            FreeLibrary(module);
             return Err("Corsair LCD DLL is missing iD_USB_enter_hardware_mode_cc021".into());
         };
 
         let mut device: *mut c_void = null_mut();
         let open_result = open(&mut device, 0x1b1c, 0x0c39, null());
         if open_result != 0 || device.is_null() {
-            FreeLibrary(module);
             return Err(format!(
                 "Corsair LCD DLL could not open the Commander Core LCD (result {open_result})"
             ));
@@ -274,9 +270,10 @@ fn restore_persisted_with_icue(serial: Option<&str>) -> Result<(), String> {
         }
         let enter_result = enter_hardware(device);
 
-        // Give the device time to consume the commands before unloading the DLL.
+        // Keep the DLL loaded for the application lifetime. This mirrors the
+        // existing hardware-image flashing path and avoids invalidating any
+        // controller state that the vendor DLL may finish asynchronously.
         thread::sleep(Duration::from_millis(30));
-        FreeLibrary(module);
 
         if set_result != 0 {
             Err(format!(
@@ -289,9 +286,7 @@ fn restore_persisted_with_icue(serial: Option<&str>) -> Result<(), String> {
         } else {
             Ok(())
         }
-    };
-
-    result
+    }
 }
 
 fn write_restore_diagnostics(lines: &[String]) {
