@@ -89,10 +89,10 @@ impl AppState {
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
-        // Check if virtual screen driver is installed on app boot
+        // Check if virtual screen driver is installed on app boot.
         if !VirtualDisplayManager::is_ready() {
             let msg = wide(
-                "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK to install the driver now."
+                "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK and Corsair Elite Display itself will request administrator permission to install the driver."
             );
             let title = wide("Virtual Screen Driver Required");
             let response = unsafe {
@@ -104,7 +104,7 @@ impl AppState {
                 )
             };
             if response == IDOK {
-                match VirtualDisplayManager::install_driver_elevated(hwnd) {
+                match crate::driver_admin::install_driver_elevated(hwnd) {
                     Ok(()) => {
                         let success_msg = wide("The Virtual Screen driver was successfully installed and configured!");
                         unsafe {
@@ -130,6 +130,7 @@ impl AppState {
             }
         } else {
             VirtualDisplayManager::deactivate();
+            let _ = crate::hardware_restore::restore_hardware_mode();
         }
         self.refresh_monitor();
         self.refresh_tray();
@@ -156,23 +157,33 @@ impl AppState {
         let _ = self.settings.save();
     }
 
+    fn restore_hardware_after_stream_stop(&self) {
+        // The worker polls the running flag and releases its HID handle on the
+        // Off transition. Give it enough time to do that before issuing the
+        // known-good hardware-mode sequence from the UI thread as a second,
+        // deterministic restore attempt.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = crate::hardware_restore::restore_hardware_mode();
+    }
+
     fn toggle(&mut self) {
         if self.settings.streaming {
             self.settings.streaming = false;
             self.controller.set_running(false);
-            VirtualDisplayManager::deactivate();
             self.save();
+            self.restore_hardware_after_stream_stop();
+            VirtualDisplayManager::deactivate();
         } else {
             if !VirtualDisplayManager::is_ready() {
                 let msg = wide(
-                    "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK to install the driver now."
+                    "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK and Corsair Elite Display itself will request administrator permission to install the driver."
                 );
                 let title = wide("Virtual Screen Driver Required");
                 let response = unsafe {
                     MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONWARNING)
                 };
                 if response == IDOK {
-                    if let Err(e) = VirtualDisplayManager::install_driver_elevated(self.hwnd) {
+                    if let Err(e) = crate::driver_admin::install_driver_elevated(self.hwnd) {
                         let err_msg = wide(&format!("Virtual Screen driver installation failed:\n\n{e}"));
                         unsafe {
                             MessageBoxW(self.hwnd, err_msg.as_ptr(), wide("Installation Error").as_ptr(), MB_OK | MB_ICONERROR);
@@ -310,7 +321,12 @@ impl AppState {
             }
 
             append_checked(menu, MENU_TOGGLE, "On/Off", self.settings.streaming);
-            append_menu(menu, MENU_SET_HARDWARE_IMAGE, "Set hardware image/GIF...");
+            append_enabled_menu(
+                menu,
+                MENU_SET_HARDWARE_IMAGE,
+                "Set hardware image/GIF...",
+                !self.settings.streaming,
+            );
             append_menu(menu, MENU_UNINSTALL_DRIVER, "Uninstall virtual display driver...");
             append_checked(
                 menu,
@@ -428,6 +444,20 @@ impl AppState {
     }
 
     fn open_hardware_image_dialog(&mut self) {
+        if self.settings.streaming {
+            let msg = wide("Turn the virtual screen Off before changing the hardware image/GIF.");
+            let caption = wide("Corsair Elite Display");
+            unsafe {
+                MessageBoxW(
+                    self.hwnd,
+                    msg.as_ptr(),
+                    caption.as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+            return;
+        }
+
         let mut file_buf = [0u16; 1024];
         let filter = wide("Image & GIF Files (*.png;*.jpg;*.jpeg;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.bmp\0All Files (*.*)\0*.*\0\0");
         let title = wide("Select Hardware Image or GIF");
@@ -450,17 +480,7 @@ impl AppState {
         let path_str = String::from_utf16_lossy(&file_buf[..len]);
         let path = std::path::Path::new(&path_str);
 
-        let was_streaming = self.settings.streaming;
-        if was_streaming {
-            self.controller.set_running(false);
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
-
         let flash_res = crate::corsair::flash_hardware_image(path);
-
-        if was_streaming {
-            self.controller.set_running(true);
-        }
 
         match flash_res {
             Ok(()) => {
@@ -481,7 +501,7 @@ impl AppState {
     }
 
     fn uninstall_driver(&mut self) {
-        let msg = wide("Are you sure you want to uninstall the Corsair Virtual Screen driver and remove its configuration?");
+        let msg = wide("Are you sure you want to uninstall the Corsair Virtual Screen driver and remove its configuration?\n\nCorsair Elite Display will close after the driver is removed.");
         let title = wide("Uninstall Virtual Display Driver");
         let confirm = unsafe {
             MessageBoxW(
@@ -499,12 +519,15 @@ impl AppState {
             self.settings.streaming = false;
             self.controller.set_running(false);
             self.save();
+            self.restore_hardware_after_stream_stop();
+        } else {
+            let _ = crate::hardware_restore::restore_hardware_mode();
         }
         VirtualDisplayManager::deactivate();
 
-        match VirtualDisplayManager::uninstall_driver_elevated(self.hwnd) {
+        match crate::driver_admin::uninstall_driver_elevated(self.hwnd) {
             Ok(()) => {
-                let success_msg = wide("The Corsair Virtual Screen driver has been successfully uninstalled.");
+                let success_msg = wide("The Corsair Virtual Screen driver has been successfully uninstalled.\n\nCorsair Elite Display will now close.");
                 unsafe {
                     MessageBoxW(
                         self.hwnd,
@@ -512,7 +535,9 @@ impl AppState {
                         title.as_ptr(),
                         MB_OK | MB_ICONINFORMATION,
                     );
+                    DestroyWindow(self.hwnd);
                 }
+                return;
             }
             Err(e) => {
                 let err_msg = wide(&format!("Failed to uninstall driver:\n\n{e}"));
@@ -534,6 +559,8 @@ impl Drop for AppState {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         self.controller.set_running(false);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
     }
 }
@@ -541,6 +568,12 @@ impl Drop for AppState {
 unsafe fn append_menu(menu: HMENU, id: usize, label: &str) {
     let label = wide(label);
     unsafe { AppendMenuW(menu, MF_STRING, id, label.as_ptr()) };
+}
+
+unsafe fn append_enabled_menu(menu: HMENU, id: usize, label: &str, enabled: bool) {
+    let label = wide(label);
+    let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED };
+    unsafe { AppendMenuW(menu, flags, id, label.as_ptr()) };
 }
 
 unsafe fn append_checked(menu: HMENU, id: usize, label: &str, checked: bool) {
@@ -670,7 +703,7 @@ pub fn run(_background: bool) {
             DispatchMessageW(&message);
         }
         drop(Box::from_raw(state));
-        // Final safety guarantee on exit: ensure LCD is switched back to hardware mode
-        let _ = crate::corsair::CorsairLcdDevice::restore_hardware_mode();
+        // Final safety guarantee on exit: ensure LCD is switched back to hardware mode.
+        let _ = crate::hardware_restore::restore_hardware_mode();
     }
 }
