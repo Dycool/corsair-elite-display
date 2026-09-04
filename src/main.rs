@@ -33,6 +33,26 @@ fn main() {
         });
     }
 
+    if args.iter().any(|arg| {
+        arg == "--hardware-mode"
+            || arg == "--restore-hardware"
+            || arg == "--off"
+            || arg == "-hw"
+    }) {
+        let result = corsair::CorsairLcdDevice::restore_hardware_mode();
+        let _ = std::fs::write(
+            std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
+            match &result {
+                Ok(()) => "Successfully restored hardware mode\n".to_string(),
+                Err(error) => format!("Failed to restore hardware mode: {error}\n"),
+            },
+        );
+        std::process::exit(match result {
+            Ok(()) => 0,
+            Err(_) => 1,
+        });
+    }
+
     // Strict single-instance guard: acquire mutex with initial ownership requested
     let mutex_name = wide("CorsairEliteDisplay_SingleInstance");
     let mutex = unsafe { CreateMutexW(null_mut(), 1, mutex_name.as_ptr()) };
@@ -51,8 +71,9 @@ fn main() {
         return;
     }
 
-    // Ensure virtual monitor is cleaned up on panic
+    // Ensure virtual monitor is cleaned up and hardware mode restored on panic
     std::panic::set_hook(Box::new(|_| {
+        let _ = corsair::CorsairLcdDevice::restore_hardware_mode();
         virtual_display::VirtualDisplayManager::deactivate();
     }));
 

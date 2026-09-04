@@ -162,6 +162,18 @@ fn enumerate_hid_paths() -> Vec<String> {
     paths
 }
 
+fn hardware_mode_packet_1() -> [u8; 32] {
+    let mut packet = [0u8; 32];
+    packet[..4].copy_from_slice(&[0x03, 0x1e, 0x01, 0x01]);
+    packet
+}
+
+fn hardware_mode_packet_2() -> [u8; 32] {
+    let mut packet = [0u8; 32];
+    packet[..4].copy_from_slice(&[0x03, 0x1d, 0x00, 0x01]);
+    packet
+}
+
 #[cfg(test)]
 fn frame_packet(chunk: &[u8], part_num: u16, is_end: bool) -> [u8; 1024] {
     debug_assert!(chunk.len() <= 1016);
@@ -355,18 +367,102 @@ impl CorsairLcdDevice {
         self.send_frame(&jpeg)
     }
 
-    /// Releases only the LCD streaming interface. Do not change Commander Core mode here:
-    /// that controller also owns cooling/lighting state and changing its global mode can leave
-    /// iCUE showing Device Memory Mode or hide the LCD configuration UI.
+    fn send_feature_packet(&self, packet: &[u8; 32]) -> Result<(), String> {
+        unsafe {
+            let mut res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
+            if res == 0 {
+                res = HidD_SetFeature(self.handle, packet.as_ptr(), 4);
+            }
+            if res == 0 {
+                return Err(format!(
+                    "HidD_SetFeature failed with Windows error {}",
+                    GetLastError()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Switches the LCD back to hardware mode using OpenLinkHub's known-good sequence:
+    /// Report 1: 03 1E 01 01
+    /// Report 2: 03 1D 00 01 (Device Session Control: 0x00 = return to hardware mode)
+    pub fn switch_to_hardware_mode(&self) -> Result<(), String> {
+        let p1 = hardware_mode_packet_1();
+        let p2 = hardware_mode_packet_2();
+        self.send_feature_packet(&p1)?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        self.send_feature_packet(&p2)?;
+        Ok(())
+    }
+
+    /// Releases the LCD streaming interface and switches the display back to hardware mode.
+    /// If switching to hardware mode fails, falls back to sending a black frame to avoid
+    /// leaving a desktop capture frozen on screen.
     pub fn release_to_hardware(self) {
-        let result = self.send_black_fallback_frame();
+        let hw_result = self.switch_to_hardware_mode();
+        let fallback_result = if hw_result.is_err() {
+            self.send_black_fallback_frame()
+        } else {
+            Ok(())
+        };
         drop(self);
 
-        if let Err(error) = result {
+        if let Err(error) = hw_result {
+            let log_msg = match fallback_result {
+                Err(fb) => format!("Hardware mode switch failed: {error}; fallback black frame failed: {fb}"),
+                Ok(()) => format!("Hardware mode switch failed: {error}; black fallback frame sent"),
+            };
             let _ = std::fs::write(
                 std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
-                error,
+                log_msg,
             );
+        }
+    }
+
+    /// Attempts to locate any connected Corsair LCD and return it to hardware mode.
+    pub fn restore_hardware_mode() -> Result<(), String> {
+        let paths = Self::find_device_paths();
+        if paths.is_empty() {
+            return Err("No supported Corsair LCD found".into());
+        }
+        let mut succeeded = false;
+        let mut last_error = String::new();
+        for path in &paths {
+            let path_u16 = to_u16_vec(path);
+            let handle = unsafe {
+                CreateFileW(
+                    path_u16.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let dev = Self {
+                handle,
+                product_name: String::new(),
+            };
+            match dev.switch_to_hardware_mode() {
+                Ok(()) => {
+                    succeeded = true;
+                }
+                Err(e) => {
+                    last_error = e;
+                }
+            }
+            drop(dev);
+        }
+        if succeeded {
+            Ok(())
+        } else if !last_error.is_empty() {
+            Err(last_error)
+        } else {
+            Err("Unable to open any Corsair LCD interface (check if iCUE has exclusive access)".into())
         }
     }
 }
@@ -384,7 +480,7 @@ impl Drop for CorsairLcdDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::frame_packet;
+    use super::{frame_packet, hardware_mode_packet_1, hardware_mode_packet_2};
 
     #[test]
     fn image_packet_has_the_observed_corsair_header_and_padding() {
@@ -392,5 +488,16 @@ mod tests {
         assert_eq!(&packet[..8], &[0x02, 0x05, 0x40, 0x01, 7, 0, 3, 0]);
         assert_eq!(&packet[8..11], &[0xff, 0xd8, 0xff]);
         assert!(packet[11..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn hardware_mode_packets_match_openlinkhub_protocol() {
+        let p1 = hardware_mode_packet_1();
+        assert_eq!(&p1[..4], &[0x03, 0x1e, 0x01, 0x01]);
+        assert!(p1[4..].iter().all(|byte| *byte == 0));
+
+        let p2 = hardware_mode_packet_2();
+        assert_eq!(&p2[..4], &[0x03, 0x1d, 0x00, 0x01]);
+        assert!(p2[4..].iter().all(|byte| *byte == 0));
     }
 }

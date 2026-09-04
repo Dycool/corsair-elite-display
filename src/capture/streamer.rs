@@ -603,12 +603,15 @@ fn stream_loop(
 
         // Detect transitions between Off and On
         if is_running != was_running {
+            let turned_off = was_running && !is_running;
             was_running = is_running;
             capture.reset_source();
             prev_pixels.clear();
             if is_running {
                 force_fresh_frames = 30;
                 set_status(&stats, "Resuming second screen...");
+            } else if turned_off && device.is_none() {
+                let _ = CorsairLcdDevice::restore_hardware_mode();
             }
         }
 

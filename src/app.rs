@@ -151,6 +151,9 @@ impl AppState {
             }
         } else {
             VirtualDisplayManager::deactivate();
+            std::thread::spawn(|| {
+                let _ = crate::corsair::CorsairLcdDevice::restore_hardware_mode();
+            });
         }
         self.refresh_monitor();
         self.refresh_tray();
@@ -565,5 +568,7 @@ pub fn run(_background: bool) {
             DispatchMessageW(&message);
         }
         drop(Box::from_raw(state));
+        // Final safety guarantee on exit: ensure LCD is switched back to hardware mode
+        let _ = crate::corsair::CorsairLcdDevice::restore_hardware_mode();
     }
 }
