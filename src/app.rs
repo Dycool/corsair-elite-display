@@ -12,6 +12,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::{StreamController, get_monitors};
+use crate::hardware_media::{HardwareMedia, HardwarePlayback};
 use crate::settings::{Settings, ViewMode, set_startup, startup_enabled};
 use crate::virtual_display::VirtualDisplayManager;
 
@@ -56,6 +57,7 @@ struct AppState {
     hwnd: HWND,
     settings: Settings,
     controller: StreamController,
+    hardware_playback: HardwarePlayback,
     taskbar_created: u32,
     icon_on: HICON,
     icon_off: HICON,
@@ -64,9 +66,11 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         let settings = Settings::load();
+        let cached_hardware_media = HardwareMedia::load_cached().ok().flatten();
         Self {
             hwnd: null_mut(),
             controller: StreamController::new(settings.clone()),
+            hardware_playback: HardwarePlayback::new(cached_hardware_media),
             settings,
             taskbar_created: 0,
             icon_on: null_mut(),
@@ -122,15 +126,17 @@ impl AppState {
         }
 
         if self.settings.streaming {
+            self.hardware_playback.stop();
             if let Err(error) = VirtualDisplayManager::activate() {
                 self.settings.streaming = false;
                 self.controller.set_running(false);
                 self.save();
+                self.show_off_display();
                 show_error(hwnd, &error);
             }
         } else {
             VirtualDisplayManager::deactivate();
-            let _ = crate::hardware_restore::restore_hardware_mode();
+            self.show_off_display();
         }
         self.refresh_monitor();
         self.refresh_tray();
@@ -157,13 +163,22 @@ impl AppState {
         let _ = self.settings.save();
     }
 
-    fn restore_hardware_after_stream_stop(&self) {
-        // The worker polls the running flag and releases its HID handle on the
-        // Off transition. Give it enough time to do that before issuing the
-        // known-good hardware-mode sequence from the UI thread as a second,
-        // deterministic restore attempt.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = crate::hardware_restore::restore_hardware_mode();
+    fn show_off_display(&mut self) {
+        // Prefer the RAM-cached hardware image/GIF. This intentionally avoids
+        // flash writes during normal On/Off transitions. A hardware-mode handoff
+        // remains only as a compatibility fallback for users who have not yet
+        // selected an image through Corsair Elite Display.
+        if !self.hardware_playback.start() {
+            let _ = crate::hardware_restore::restore_hardware_mode();
+        }
+    }
+
+    fn restore_hardware_after_stream_stop(&mut self) {
+        // The desktop worker owns the LCD HID handle while On. Wait for it to
+        // observe the Off flag, finish any in-flight JPEG, and release the handle
+        // before the separate hardware-media playback worker starts.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        self.show_off_display();
     }
 
     fn toggle(&mut self) {
@@ -174,6 +189,10 @@ impl AppState {
             self.restore_hardware_after_stream_stop();
             VirtualDisplayManager::deactivate();
         } else {
+            // GIF playback must be fully stopped before desktop streaming opens
+            // the LCD, otherwise two independent USB writers could interleave.
+            self.hardware_playback.stop();
+
             if !VirtualDisplayManager::is_ready() {
                 let msg = wide(
                     "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK and Corsair Elite Display itself will request administrator permission to install the driver."
@@ -188,6 +207,7 @@ impl AppState {
                         unsafe {
                             MessageBoxW(self.hwnd, err_msg.as_ptr(), wide("Installation Error").as_ptr(), MB_OK | MB_ICONERROR);
                         }
+                        self.show_off_display();
                         return;
                     }
                     let ok_msg = wide("The Virtual Screen driver was successfully installed and configured!");
@@ -195,12 +215,14 @@ impl AppState {
                         MessageBoxW(self.hwnd, ok_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
                     }
                 } else {
+                    self.show_off_display();
                     return;
                 }
             }
 
             if let Err(error) = VirtualDisplayManager::activate() {
                 show_error(self.hwnd, &error);
+                self.show_off_display();
                 return;
             }
 
@@ -480,17 +502,50 @@ impl AppState {
         let path_str = String::from_utf16_lossy(&file_buf[..len]);
         let path = std::path::Path::new(&path_str);
 
+        // Stop any existing OFF-mode GIF before the flashing code opens the LCD.
+        // The flash implementation itself is intentionally unchanged.
+        self.hardware_playback.stop();
         let flash_res = crate::corsair::flash_hardware_image(path);
 
         match flash_res {
             Ok(()) => {
-                let msg = wide("Hardware image/GIF has been successfully applied to your cooler screen!");
-                let caption = wide("Corsair Elite Display");
-                unsafe {
-                    MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                match HardwareMedia::from_path(path) {
+                    Ok(media) => {
+                        let cache_warning = media.persist_cache().err();
+                        self.hardware_playback.replace_media(media);
+                        self.show_off_display();
+
+                        let text = if let Some(warning) = cache_warning {
+                            format!(
+                                "Hardware image/GIF was applied successfully and is active in RAM for Off mode.\n\nThe persistent app cache could not be saved, so it will need to be selected again after restarting the app:\n\n{warning}"
+                            )
+                        } else {
+                            "Hardware image/GIF has been successfully applied to your cooler screen and cached for Off mode!".to_string()
+                        };
+                        let msg = wide(&text);
+                        let caption = wide("Corsair Elite Display");
+                        unsafe {
+                            MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                        }
+                    }
+                    Err(media_error) => {
+                        // The hardware flash succeeded, but do not let an older RAM
+                        // cache overwrite the newly-selected image.
+                        self.hardware_playback.clear_media();
+                        let _ = crate::hardware_restore::restore_hardware_mode();
+                        let msg = wide(&format!(
+                            "Hardware image/GIF was applied to the cooler, but Corsair Elite Display could not prepare its RAM copy for Off mode:\n\n{media_error}"
+                        ));
+                        let caption = wide("Corsair Elite Display - Cache Warning");
+                        unsafe {
+                            MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONWARNING);
+                        }
+                    }
                 }
             }
             Err(err) => {
+                // Flashing failed; resume the previous cached OFF media unchanged.
+                self.show_off_display();
                 let msg = wide(&format!("Failed to apply hardware image:\n\n{err}"));
                 let caption = wide("Corsair Elite Display - Error");
                 unsafe {
@@ -515,14 +570,16 @@ impl AppState {
             return;
         }
 
+        // Uninstall is followed by process exit, so stop software playback and
+        // return the cooler to its actual persisted hardware state first.
+        self.hardware_playback.stop();
         if self.settings.streaming {
             self.settings.streaming = false;
             self.controller.set_running(false);
             self.save();
-            self.restore_hardware_after_stream_stop();
-        } else {
-            let _ = crate::hardware_restore::restore_hardware_mode();
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
+        let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
 
         match crate::driver_admin::uninstall_driver_elevated(self.hwnd) {
@@ -558,6 +615,7 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+        self.hardware_playback.stop();
         self.controller.set_running(false);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = crate::hardware_restore::restore_hardware_mode();
@@ -579,7 +637,7 @@ unsafe fn append_enabled_menu(menu: HMENU, id: usize, label: &str, enabled: bool
 unsafe fn append_checked(menu: HMENU, id: usize, label: &str, checked: bool) {
     let label = wide(label);
     let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
-    unsafe { AppendMenuW(menu, flags, id, label.as_ptr()) };
+    unsafe { AppendMenuW(menu, MF_POPUP, submenu as usize, label.as_ptr()) };
 }
 
 unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
