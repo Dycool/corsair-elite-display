@@ -93,7 +93,6 @@ impl AppState {
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
-        // Check if virtual screen driver is installed on app boot.
         if !VirtualDisplayManager::is_ready() {
             let msg = wide(
                 "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK and Corsair Elite Display itself will request administrator permission to install the driver."
@@ -164,19 +163,12 @@ impl AppState {
     }
 
     fn show_off_display(&mut self) {
-        // Prefer the RAM-cached hardware image/GIF. This intentionally avoids
-        // flash writes during normal On/Off transitions. A hardware-mode handoff
-        // remains only as a compatibility fallback for users who have not yet
-        // selected an image through Corsair Elite Display.
         if !self.hardware_playback.start() {
             let _ = crate::hardware_restore::restore_hardware_mode();
         }
     }
 
     fn restore_hardware_after_stream_stop(&mut self) {
-        // The desktop worker owns the LCD HID handle while On. Wait for it to
-        // observe the Off flag, finish any in-flight JPEG, and release the handle
-        // before the separate hardware-media playback worker starts.
         std::thread::sleep(std::time::Duration::from_millis(150));
         self.show_off_display();
     }
@@ -189,8 +181,6 @@ impl AppState {
             self.restore_hardware_after_stream_stop();
             VirtualDisplayManager::deactivate();
         } else {
-            // GIF playback must be fully stopped before desktop streaming opens
-            // the LCD, otherwise two independent USB writers could interleave.
             self.hardware_playback.stop();
 
             if !VirtualDisplayManager::is_ready() {
@@ -502,8 +492,6 @@ impl AppState {
         let path_str = String::from_utf16_lossy(&file_buf[..len]);
         let path = std::path::Path::new(&path_str);
 
-        // Stop any existing OFF-mode GIF before the flashing code opens the LCD.
-        // The flash implementation itself is intentionally unchanged.
         self.hardware_playback.stop();
         let flash_res = crate::corsair::flash_hardware_image(path);
 
@@ -529,8 +517,6 @@ impl AppState {
                         }
                     }
                     Err(media_error) => {
-                        // The hardware flash succeeded, but do not let an older RAM
-                        // cache overwrite the newly-selected image.
                         self.hardware_playback.clear_media();
                         let _ = crate::hardware_restore::restore_hardware_mode();
                         let msg = wide(&format!(
@@ -544,7 +530,6 @@ impl AppState {
                 }
             }
             Err(err) => {
-                // Flashing failed; resume the previous cached OFF media unchanged.
                 self.show_off_display();
                 let msg = wide(&format!("Failed to apply hardware image:\n\n{err}"));
                 let caption = wide("Corsair Elite Display - Error");
@@ -570,8 +555,6 @@ impl AppState {
             return;
         }
 
-        // Uninstall is followed by process exit, so stop software playback and
-        // return the cooler to its actual persisted hardware state first.
         self.hardware_playback.stop();
         if self.settings.streaming {
             self.settings.streaming = false;
@@ -637,7 +620,7 @@ unsafe fn append_enabled_menu(menu: HMENU, id: usize, label: &str, enabled: bool
 unsafe fn append_checked(menu: HMENU, id: usize, label: &str, checked: bool) {
     let label = wide(label);
     let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
-    unsafe { AppendMenuW(menu, MF_POPUP, submenu as usize, label.as_ptr()) };
+    unsafe { AppendMenuW(menu, flags, id, label.as_ptr()) };
 }
 
 unsafe fn append_submenu(menu: HMENU, submenu: HMENU, label: &str) {
@@ -761,7 +744,6 @@ pub fn run(_background: bool) {
             DispatchMessageW(&message);
         }
         drop(Box::from_raw(state));
-        // Final safety guarantee on exit: ensure LCD is switched back to hardware mode.
         let _ = crate::hardware_restore::restore_hardware_mode();
     }
 }
