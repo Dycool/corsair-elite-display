@@ -135,7 +135,7 @@ fn enumerate_hid_paths() -> Vec<String> {
 
 fn hardware_mode_packet_1() -> [u8; 32] {
     let mut packet = [0u8; 32];
-    packet[..4].copy_from_slice(&[0x03, 0x1e, 0x00, 0x01]);
+    packet[..4].copy_from_slice(&[0x03, 0x1e, 0x01, 0x01]);
     packet
 }
 
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn hardware_mode_packets_match_openlinkhub_protocol() {
         let p1 = hardware_mode_packet_1();
-        assert_eq!(&p1[..4], &[0x03, 0x1e, 0x00, 0x01]);
+        assert_eq!(&p1[..4], &[0x03, 0x1e, 0x01, 0x01]);
         assert!(p1[4..].iter().all(|byte| *byte == 0));
 
         let p2 = hardware_mode_packet_2();
