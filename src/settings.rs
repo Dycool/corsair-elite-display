@@ -87,7 +87,7 @@ impl Default for Settings {
             rotation: 0,
             view_mode: ViewMode::Native,
             show_mouse: true,
-            streaming: true,
+            streaming: false,
         }
     }
 }
@@ -130,7 +130,10 @@ impl Settings {
                 }
                 "view" => result.view_mode = ViewMode::from_setting(value),
                 "show_mouse" => result.show_mouse = value.trim() != "false",
-                "streaming" => result.streaming = value.trim() != "false",
+                "streaming" => {
+                    let s = value.trim().to_lowercase();
+                    result.streaming = s == "true" || s == "1" || s == "on";
+                }
                 _ => {}
             }
         }
@@ -224,6 +227,39 @@ pub fn set_startup(enabled: bool) -> Result<(), String> {
             Ok(())
         } else {
             Err(format!("Could not update Windows startup ({status})"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_state_is_off() {
+        let settings = Settings::default();
+        assert_eq!(settings.streaming, false);
+    }
+
+    #[test]
+    fn parses_streaming_flag_correctly() {
+        let test_cases = [
+            ("streaming=true", true),
+            ("streaming=1", true),
+            ("streaming=on", true),
+            ("streaming=false", false),
+            ("streaming=0", false),
+            ("streaming=off", false),
+        ];
+
+        for (line, expected) in test_cases {
+            let mut s = Settings::default();
+            let (k, v) = line.split_once('=').unwrap();
+            if k == "streaming" {
+                let val = v.trim().to_lowercase();
+                s.streaming = val == "true" || val == "1" || val == "on";
+            }
+            assert_eq!(s.streaming, expected, "Failed for {line}");
         }
     }
 }

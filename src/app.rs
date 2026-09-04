@@ -25,6 +25,8 @@ const MENU_TOGGLE: usize = 200;
 const MENU_STARTUP: usize = 201;
 const MENU_EXIT: usize = 202;
 const MENU_SHOW_MOUSE: usize = 203;
+const MENU_SET_HARDWARE_IMAGE: usize = 204;
+const MENU_UNINSTALL_DRIVER: usize = 205;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
@@ -87,57 +89,34 @@ impl AppState {
         self.taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
         self.add_tray_icon();
 
-        // Check if virtual screen driver & configuration are ready on boot
+        // Check if virtual screen driver is installed on app boot
         if !VirtualDisplayManager::is_ready() {
-            if !VirtualDisplayManager::is_admin() {
-                let msg = wide(
-                    "Corsair Elite Display requires Administrator privileges to set up the Virtual Screen driver for the first time.\n\nWould you like to grant Administrator privileges now?"
-                );
-                let title = wide("Corsair Elite Display - Setup");
-                let response = unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        msg.as_ptr(),
-                        title.as_ptr(),
-                        MB_YESNO | MB_ICONQUESTION,
-                    )
-                };
-                if response == IDYES {
-                    let mut exe_path = [0u16; 1024];
-                    let len = unsafe {
-                        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
-                            null_mut(),
-                            exe_path.as_mut_ptr(),
-                            exe_path.len() as u32,
-                        )
-                    };
-                    if len > 0 {
+            let msg = wide(
+                "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK to install the driver now."
+            );
+            let title = wide("Virtual Screen Driver Required");
+            let response = unsafe {
+                MessageBoxW(
+                    hwnd,
+                    msg.as_ptr(),
+                    title.as_ptr(),
+                    MB_OKCANCEL | MB_ICONWARNING,
+                )
+            };
+            if response == IDOK {
+                match VirtualDisplayManager::install_driver_elevated(hwnd) {
+                    Ok(()) => {
+                        let success_msg = wide("The Virtual Screen driver was successfully installed and configured!");
                         unsafe {
-                            windows_sys::Win32::UI::Shell::ShellExecuteW(
-                                null_mut(),
-                                wide("runas").as_ptr(),
-                                exe_path.as_ptr(),
-                                null(),
-                                null(),
-                                SW_SHOWNORMAL,
-                            );
+                            MessageBoxW(hwnd, success_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
                         }
-                        std::process::exit(0);
                     }
-                } else {
-                    let cancel_msg = wide(
-                        "Virtual Screen setup was skipped.\n\nPlease run Corsair Elite Display as Administrator to enable the cooler display."
-                    );
-                    unsafe {
-                        MessageBoxW(hwnd, cancel_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    Err(e) => {
+                        let err_msg = wide(&format!("Virtual Screen driver installation failed:\n\n{e}"));
+                        unsafe {
+                            MessageBoxW(hwnd, err_msg.as_ptr(), wide("Installation Error").as_ptr(), MB_OK | MB_ICONERROR);
+                        }
                     }
-                    self.settings.streaming = false;
-                    self.save();
-                }
-            } else {
-                // Running as Administrator: install driver, write config, and restart virtual display
-                if let Err(error) = VirtualDisplayManager::configure_and_restart() {
-                    show_error(hwnd, &format!("Virtual Screen configuration error:\n{error}"));
                 }
             }
         }
@@ -151,9 +130,6 @@ impl AppState {
             }
         } else {
             VirtualDisplayManager::deactivate();
-            std::thread::spawn(|| {
-                let _ = crate::corsair::CorsairLcdDevice::restore_hardware_mode();
-            });
         }
         self.refresh_monitor();
         self.refresh_tray();
@@ -186,17 +162,37 @@ impl AppState {
             self.controller.set_running(false);
             VirtualDisplayManager::deactivate();
             self.save();
-        } else if let Err(error) = VirtualDisplayManager::activate() {
-            if !VirtualDisplayManager::is_admin() && !VirtualDisplayManager::is_ready() {
-                let msg = wide("Administrator privileges are required to install and configure the Virtual Screen driver.\n\nPlease run Corsair Elite Display as Administrator.");
-                let title = wide("Administrator Privileges Required");
-                unsafe {
-                    MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
-                }
-            } else {
-                show_error(self.hwnd, &error);
-            }
         } else {
+            if !VirtualDisplayManager::is_ready() {
+                let msg = wide(
+                    "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK to install the driver now."
+                );
+                let title = wide("Virtual Screen Driver Required");
+                let response = unsafe {
+                    MessageBoxW(self.hwnd, msg.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONWARNING)
+                };
+                if response == IDOK {
+                    if let Err(e) = VirtualDisplayManager::install_driver_elevated(self.hwnd) {
+                        let err_msg = wide(&format!("Virtual Screen driver installation failed:\n\n{e}"));
+                        unsafe {
+                            MessageBoxW(self.hwnd, err_msg.as_ptr(), wide("Installation Error").as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                        return;
+                    }
+                    let ok_msg = wide("The Virtual Screen driver was successfully installed and configured!");
+                    unsafe {
+                        MessageBoxW(self.hwnd, ok_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    }
+                } else {
+                    return;
+                }
+            }
+
+            if let Err(error) = VirtualDisplayManager::activate() {
+                show_error(self.hwnd, &error);
+                return;
+            }
+
             self.settings.streaming = true;
             self.apply();
         }
@@ -314,6 +310,8 @@ impl AppState {
             }
 
             append_checked(menu, MENU_TOGGLE, "On/Off", self.settings.streaming);
+            append_menu(menu, MENU_SET_HARDWARE_IMAGE, "Set hardware image/GIF...");
+            append_menu(menu, MENU_UNINSTALL_DRIVER, "Uninstall virtual display driver...");
             append_checked(
                 menu,
                 MENU_SHOW_MOUSE,
@@ -389,6 +387,8 @@ impl AppState {
 
             match command {
                 MENU_TOGGLE => self.toggle(),
+                MENU_SET_HARDWARE_IMAGE => self.open_hardware_image_dialog(),
+                MENU_UNINSTALL_DRIVER => self.uninstall_driver(),
                 MENU_SHOW_MOUSE => {
                     self.settings.show_mouse = !self.settings.show_mouse;
                     self.apply();
@@ -425,6 +425,108 @@ impl AppState {
                 _ => {}
             }
         }
+    }
+
+    fn open_hardware_image_dialog(&mut self) {
+        let mut file_buf = [0u16; 1024];
+        let filter = wide("Image & GIF Files (*.png;*.jpg;*.jpeg;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.bmp\0All Files (*.*)\0*.*\0\0");
+        let title = wide("Select Hardware Image or GIF");
+        let mut ofn: windows_sys::Win32::UI::Controls::Dialogs::OPENFILENAMEW = unsafe { zeroed() };
+        ofn.lStructSize = size_of::<windows_sys::Win32::UI::Controls::Dialogs::OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = self.hwnd;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.lpstrFile = file_buf.as_mut_ptr();
+        ofn.nMaxFile = file_buf.len() as u32;
+        ofn.lpstrTitle = title.as_ptr();
+        ofn.Flags = windows_sys::Win32::UI::Controls::Dialogs::OFN_FILEMUSTEXIST
+            | windows_sys::Win32::UI::Controls::Dialogs::OFN_PATHMUSTEXIST;
+
+        let ok = unsafe { windows_sys::Win32::UI::Controls::Dialogs::GetOpenFileNameW(&mut ofn) };
+        if ok == 0 {
+            return;
+        }
+
+        let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let path_str = String::from_utf16_lossy(&file_buf[..len]);
+        let path = std::path::Path::new(&path_str);
+
+        let was_streaming = self.settings.streaming;
+        if was_streaming {
+            self.controller.set_running(false);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+
+        let flash_res = crate::corsair::flash_hardware_image(path);
+
+        if was_streaming {
+            self.controller.set_running(true);
+        }
+
+        match flash_res {
+            Ok(()) => {
+                let msg = wide("Hardware image/GIF has been successfully applied to your cooler screen!");
+                let caption = wide("Corsair Elite Display");
+                unsafe {
+                    MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            Err(err) => {
+                let msg = wide(&format!("Failed to apply hardware image:\n\n{err}"));
+                let caption = wide("Corsair Elite Display - Error");
+                unsafe {
+                    MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+    }
+
+    fn uninstall_driver(&mut self) {
+        let msg = wide("Are you sure you want to uninstall the Corsair Virtual Screen driver and remove its configuration?");
+        let title = wide("Uninstall Virtual Display Driver");
+        let confirm = unsafe {
+            MessageBoxW(
+                self.hwnd,
+                msg.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONQUESTION,
+            )
+        };
+        if confirm != IDYES {
+            return;
+        }
+
+        if self.settings.streaming {
+            self.settings.streaming = false;
+            self.controller.set_running(false);
+            self.save();
+        }
+        VirtualDisplayManager::deactivate();
+
+        match VirtualDisplayManager::uninstall_driver_elevated(self.hwnd) {
+            Ok(()) => {
+                let success_msg = wide("The Corsair Virtual Screen driver has been successfully uninstalled.");
+                unsafe {
+                    MessageBoxW(
+                        self.hwnd,
+                        success_msg.as_ptr(),
+                        title.as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+            Err(e) => {
+                let err_msg = wide(&format!("Failed to uninstall driver:\n\n{e}"));
+                unsafe {
+                    MessageBoxW(
+                        self.hwnd,
+                        err_msg.as_ptr(),
+                        wide("Uninstall Error").as_ptr(),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
+        }
+        self.refresh_tray();
     }
 }
 

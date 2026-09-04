@@ -6,7 +6,7 @@ authors = ["Diogo"]
 description = "A lightweight Windows tray app that turns a Corsair Elite LCD into a real second display"
 
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -19,6 +19,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

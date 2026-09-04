@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 use image::ExtendedColorType;
 
@@ -76,7 +76,7 @@ unsafe extern "system" {
         ReportBufferLength: u32,
     ) -> u8;
 
-    fn HidD_GetProductString(
+    fn HidD_GetSerialNumberString(
         HidDeviceObject: *mut std::ffi::c_void,
         Buffer: *mut u16,
         BufferLength: u32,
@@ -88,35 +88,6 @@ fn to_u16_vec(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
-}
-
-fn query_product_string(path: &str) -> Option<String> {
-    let path_u16 = to_u16_vec(path);
-    let handle = unsafe {
-        CreateFileW(
-            path_u16.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            null_mut(),
-            OPEN_EXISTING,
-            0,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-    let mut buf = [0u16; 256];
-    let ok = unsafe { HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32) };
-    unsafe {
-        CloseHandle(handle);
-    }
-    if ok != 0 {
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..len]))
-    } else {
-        None
-    }
 }
 
 fn enumerate_hid_paths() -> Vec<String> {
@@ -164,7 +135,7 @@ fn enumerate_hid_paths() -> Vec<String> {
 
 fn hardware_mode_packet_1() -> [u8; 32] {
     let mut packet = [0u8; 32];
-    packet[..4].copy_from_slice(&[0x03, 0x1e, 0x01, 0x01]);
+    packet[..4].copy_from_slice(&[0x03, 0x1e, 0x00, 0x01]);
     packet
 }
 
@@ -202,14 +173,8 @@ impl CorsairLcdDevice {
         let mut matches = Vec::new();
         for path in enumerate_hid_paths() {
             let upper = path.to_uppercase();
-            if upper.contains("VID_1B1C") {
-                if SUPPORTED_PIDS.iter().any(|pid| upper.contains(pid)) {
-                    matches.push(path);
-                } else if let Some(product_name) = query_product_string(&path) {
-                    if product_name.to_uppercase().contains("LCD") {
-                        matches.push(path);
-                    }
-                }
+            if upper.contains("VID_1B1C") && SUPPORTED_PIDS.iter().any(|pid| upper.contains(pid)) {
+                matches.push(path);
             }
         }
         matches
@@ -235,20 +200,9 @@ impl CorsairLcdDevice {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                let mut buf = [0u16; 256];
-                let ok = unsafe {
-                    HidD_GetProductString(handle, buf.as_mut_ptr(), (buf.len() * 2) as u32)
-                };
-                let product_name = if ok != 0 {
-                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                    String::from_utf16_lossy(&buf[..len])
-                } else {
-                    "Corsair Elite LCD".to_string()
-                };
-
                 return Ok(Self {
                     handle,
-                    product_name,
+                    product_name: "Corsair Elite LCD".to_string(),
                 });
             }
             last_error = unsafe { GetLastError() };
@@ -261,6 +215,19 @@ impl CorsairLcdDevice {
     #[allow(dead_code)]
     pub fn product_name(&self) -> &str {
         &self.product_name
+    }
+
+    pub fn get_serial_number(&self) -> Option<String> {
+        let mut buf = [0u16; 128];
+        let ok = unsafe {
+            HidD_GetSerialNumberString(self.handle, buf.as_mut_ptr(), (buf.len() * 2) as u32)
+        };
+        if ok != 0 {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            String::from_utf16(&buf[..len]).ok()
+        } else {
+            None
+        }
     }
 
     pub fn set_brightness(&self, percent: u8) -> Result<(), String> {
@@ -467,6 +434,243 @@ impl CorsairLcdDevice {
     }
 }
 
+type FnOpenDevice = unsafe extern "C" fn(
+    dev: *mut *mut std::ffi::c_void,
+    vid: u16,
+    pid: u16,
+    path: *const u16,
+) -> i32;
+
+type FnSetSerialNumber = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    serial: *const u8,
+    len: u32,
+) -> i32;
+
+type FnSetIdisplaySerialNumber = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    serial: *const u8,
+    len: u32,
+) -> i32;
+
+#[repr(C)]
+struct HwBgParam {
+    unknown: u32,
+    size: u32,
+    data: *const u8,
+}
+
+type FnUpdateHardwareModeBackground = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    param: *const HwBgParam,
+) -> i32;
+
+type FnUpdateCustomizedAnimationSegment = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    data: *const u8,
+    len: u32,
+    segment_idx: u32,
+    crc: u32,
+) -> i32;
+
+type FnDeleteScreenConfig = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+) -> i32;
+
+type FnPerformScreenConfig = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+) -> i32;
+
+type FnSetVisibleOfItem = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    item_id: u8,
+    visible: u8,
+) -> i32;
+
+type FnSetHardwareMode = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    mode: i32,
+) -> i32;
+
+type FnEnterHardwareMode = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+) -> i32;
+
+type FnSetCustomizedAnimation = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    slot: u16,
+) -> i32;
+
+type FnSetBootAnimation = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    slot: u16,
+) -> i32;
+
+type FnPlayCustomizedAnimation = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+) -> i32;
+
+type FnPlayBootAnimation = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+) -> i32;
+
+type FnShowFullScreenImage = unsafe extern "C" fn(
+    dev: *mut std::ffi::c_void,
+    data: *const u8,
+    len: u32,
+) -> i32;
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+pub fn flash_hardware_image(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", path.display()));
+    }
+
+    // 1. Load image and process to 480x480 RGB JPEG
+    let dynamic_img = image::open(path).map_err(|e| format!("Failed to read image: {e}"))?;
+    let resized = dynamic_img.resize_exact(480, 480, image::imageops::FilterType::Lanczos3);
+    let rgb = resized.to_rgb8();
+    let mut jpeg_data = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 95)
+        .encode(&rgb, 480, 480, ExtendedColorType::Rgb8)
+        .map_err(|e| format!("JPEG encoding failed: {e}"))?;
+
+    // 2. Try DLL-based flashing via iD_BD_x64_cc021.dll
+    let dll_path = to_u16_vec(r"C:\Program Files\Corsair\Corsair iCUE5 Software\iD_BD_x64_cc021.dll");
+    let h_module = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(dll_path.as_ptr()) };
+
+    let mut dll_success = false;
+    if !h_module.is_null() {
+        unsafe {
+            let get_fn = |name: &[u8]| -> *mut std::ffi::c_void {
+                windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                    h_module,
+                    name.as_ptr(),
+                ).map(|f| f as *mut std::ffi::c_void).unwrap_or(null_mut())
+            };
+
+            let fn_open: Option<FnOpenDevice> = std::mem::transmute(get_fn(b"iD_USB_open_device_cc021\0"));
+            let fn_serial: Option<FnSetSerialNumber> = std::mem::transmute(get_fn(b"iD_USB_set_serial_number_cc021\0"));
+            let fn_idisplay: Option<FnSetIdisplaySerialNumber> = std::mem::transmute(get_fn(b"iD_USB_set_idisplay_serial_number_cc021\0"));
+            let fn_update_bg: Option<FnUpdateHardwareModeBackground> = std::mem::transmute(get_fn(b"iD_USB_update_hardware_mode_background_cc021\0"));
+            let fn_update_anim: Option<FnUpdateCustomizedAnimationSegment> = std::mem::transmute(get_fn(b"iD_USB_update_customized_animation_segment_cc021\0"));
+            let fn_delete: Option<FnDeleteScreenConfig> = std::mem::transmute(get_fn(b"iD_USB_delete_screen_config_cc021\0"));
+            let fn_perform: Option<FnPerformScreenConfig> = std::mem::transmute(get_fn(b"iD_USB_perform_screen_config_cc021\0"));
+            let fn_visible: Option<FnSetVisibleOfItem> = std::mem::transmute(get_fn(b"iD_USB_set_visible_of_item_cc021\0"));
+            let fn_set_hw: Option<FnSetHardwareMode> = std::mem::transmute(get_fn(b"iD_USB_set_hardware_mode_cc021\0"));
+            let fn_enter_hw: Option<FnEnterHardwareMode> = std::mem::transmute(get_fn(b"iD_USB_enter_hardware_mode_cc021\0"));
+            let fn_set_cust: Option<FnSetCustomizedAnimation> = std::mem::transmute(get_fn(b"iD_USB_set_customized_animation_cc021\0"));
+            let fn_set_boot: Option<FnSetBootAnimation> = std::mem::transmute(get_fn(b"iD_USB_set_boot_animation_cc021\0"));
+            let fn_play_cust: Option<FnPlayCustomizedAnimation> = std::mem::transmute(get_fn(b"iD_USB_play_customized_animation_cc021\0"));
+            let fn_play_boot: Option<FnPlayBootAnimation> = std::mem::transmute(get_fn(b"iD_USB_play_boot_animation_cc021\0"));
+            let fn_show: Option<FnShowFullScreenImage> = std::mem::transmute(get_fn(b"iD_USB_show_full_screen_image_cc021\0"));
+
+            if let (Some(open), Some(serial), Some(update_bg), Some(visible), Some(perform), Some(set_hw), Some(show)) =
+                (fn_open, fn_serial, fn_update_bg, fn_visible, fn_perform, fn_set_hw, fn_show)
+            {
+                let mut dev: *mut std::ffi::c_void = null_mut();
+                let res = open(&mut dev, 0x1B1C, 0x0C39, null());
+                if res == 0 && !dev.is_null() {
+                    // Dynamically retrieve and pass the device USB descriptor serial number if available
+                    if let Ok(lcd) = CorsairLcdDevice::open() {
+                        if let Some(serial_str) = lcd.get_serial_number() {
+                            let mut serial_bytes = serial_str.into_bytes();
+                            serial_bytes.push(0);
+                            serial(dev, serial_bytes.as_ptr(), (serial_bytes.len() - 1) as u32);
+                            if let Some(idisplay) = fn_idisplay {
+                                idisplay(dev, serial_bytes.as_ptr(), (serial_bytes.len() - 1) as u32);
+                            }
+                        }
+                    }
+
+                    // Flash background image to pump cap flash memory
+                    let param = HwBgParam {
+                        unknown: 0,
+                        size: jpeg_data.len() as u32,
+                        data: jpeg_data.as_ptr(),
+                    };
+                    let bg_res = update_bg(dev, &param);
+
+                    // Flash customized animation segment with proper container
+                    if let Some(update_anim) = fn_update_anim {
+                        let mut anim_buf = Vec::with_capacity(13 + jpeg_data.len());
+                        anim_buf.push(1u8); // type = 1
+                        anim_buf.extend_from_slice(&480u16.to_le_bytes()); // width
+                        anim_buf.extend_from_slice(&480u16.to_le_bytes()); // height
+                        anim_buf.extend_from_slice(&33u16.to_le_bytes());  // delay
+                        anim_buf.extend_from_slice(&1u16.to_le_bytes());   // frame count
+                        anim_buf.extend_from_slice(&(jpeg_data.len() as u32).to_le_bytes());
+                        anim_buf.extend_from_slice(&jpeg_data);
+                        
+                        let crc = crc32(&jpeg_data);
+
+                        update_anim(dev, anim_buf.as_ptr(), anim_buf.len() as u32, 0, crc);
+                    }
+
+                    // Delete sensor widgets so no number or gauge is drawn over the hardware image
+                    if let Some(delete) = fn_delete {
+                        delete(dev);
+                        perform(dev);
+                    }
+
+                    // Hide overlay widgets 1..=8 and keep item 0 (background) visible
+                    for item_id in 1..=8 {
+                        visible(dev, item_id, 0);
+                    }
+                    visible(dev, 0, 1);
+                    perform(dev);
+
+                    // Set hardware mode to 0 (Image/Animation mode, NOT sensor number mode 1)
+                    set_hw(dev, 0);
+
+                    // Activate boot and customized animation slots
+                    if let Some(set_cust) = fn_set_cust { set_cust(dev, 0); }
+                    if let Some(set_boot) = fn_set_boot { set_boot(dev, 0); }
+                    if let Some(play_cust) = fn_play_cust { play_cust(dev); }
+                    if let Some(play_boot) = fn_play_boot { play_boot(dev); }
+
+                    // Immediately show full screen image
+                    show(dev, jpeg_data.as_ptr(), jpeg_data.len() as u32);
+
+                    if let Some(enter_hw) = fn_enter_hw {
+                        enter_hw(dev);
+                    }
+
+                    if bg_res == 0 {
+                        dll_success = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Always also send frame directly via our native HID transport to guarantee immediate display
+    let hid_res = CorsairLcdDevice::open().and_then(|dev| {
+        let _ = dev.switch_to_hardware_mode();
+        dev.send_frame(&jpeg_data)
+    });
+
+    if dll_success || hid_res.is_ok() {
+        Ok(())
+    } else {
+        Err("Failed to flash image to Corsair Elite LCD. Ensure the device is connected and not locked by another application.".into())
+    }
+}
+
 impl Drop for CorsairLcdDevice {
     fn drop(&mut self) {
         if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
@@ -493,11 +697,27 @@ mod tests {
     #[test]
     fn hardware_mode_packets_match_openlinkhub_protocol() {
         let p1 = hardware_mode_packet_1();
-        assert_eq!(&p1[..4], &[0x03, 0x1e, 0x01, 0x01]);
+        assert_eq!(&p1[..4], &[0x03, 0x1e, 0x00, 0x01]);
         assert!(p1[4..].iter().all(|byte| *byte == 0));
 
         let p2 = hardware_mode_packet_2();
         assert_eq!(&p2[..4], &[0x03, 0x1d, 0x00, 0x01]);
         assert!(p2[4..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn image_resizing_and_jpeg_encoding() {
+        let img = image::RgbImage::new(100, 100);
+        let dynamic = image::DynamicImage::ImageRgb8(img);
+        let resized = dynamic.resize_exact(480, 480, image::imageops::FilterType::Lanczos3);
+        assert_eq!(resized.width(), 480);
+        assert_eq!(resized.height(), 480);
+        let rgb = resized.to_rgb8();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(&rgb, 480, 480, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(jpeg.len() > 100);
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
     }
 }
