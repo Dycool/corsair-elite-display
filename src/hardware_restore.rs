@@ -26,6 +26,8 @@ const SUPPORTED_PIDS: &[&str] = &[
     "PID_0C5B",
 ];
 
+const COMMANDER_CORE_LCD_PID: &str = "PID_0C39";
+
 // The streaming transport writes 1024-byte output reports. Requiring an HID
 // interface with at least that output-report size prevents a different HID
 // interface on the same Corsair composite device from producing a false
@@ -166,6 +168,15 @@ fn hardware_mode_packet_2() -> [u8; 4] {
     [0x03, 0x1d, 0x00, 0x01]
 }
 
+fn commander_core_stop_packet() -> [u8; 4] {
+    // OpenLinkHub's normal Commander Core Stop() sends this third LCD feature
+    // report after the two hardware-mode reports. Its dirty/minimal shutdown
+    // omits it. This is the live LCD brightness/refresh command; it does not
+    // select a hardware image slot, rewrite flash, or alter persisted image/GIF
+    // contents.
+    [0x03, 0x0b, 0x40, 0x01]
+}
+
 unsafe fn report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
     let mut preparsed: *mut c_void = null_mut();
     if unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } == 0 || preparsed.is_null() {
@@ -249,6 +260,7 @@ unsafe fn send_feature_hidapi_style(
 unsafe fn send_hardware_handoff(
     handle: *mut c_void,
     caps: ReportCaps,
+    is_commander_core: bool,
 ) -> Result<(), String> {
     let first = hardware_mode_packet_1();
     let second = hardware_mode_packet_2();
@@ -256,6 +268,17 @@ unsafe fn send_hardware_handoff(
     unsafe { send_feature_hidapi_style(handle, &first, caps.feature_len) }?;
     thread::sleep(Duration::from_millis(10));
     unsafe { send_feature_hidapi_style(handle, &second, caps.feature_len) }?;
+
+    if is_commander_core {
+        // PID 0C39 is the Commander Core LCD path. Match OpenLinkHub's normal
+        // Stop(), which sends one additional volatile LCD report after leaving
+        // software mode. This is intentionally not any of the Corsair DLL
+        // slot/configuration calls that previously disturbed the saved image.
+        thread::sleep(Duration::from_millis(10));
+        let third = commander_core_stop_packet();
+        unsafe { send_feature_hidapi_style(handle, &third, caps.feature_len) }?;
+    }
+
     Ok(())
 }
 
@@ -271,8 +294,10 @@ fn write_restore_diagnostics(lines: &[String]) {
 ///
 /// OFF is intentionally non-destructive. It does not call the iCUE DLL, select
 /// slots, play/reset animations, write flash, or alter hardware-image contents.
-/// It only mirrors OpenLinkHub's two hardware-mode reports, using the HID
-/// descriptor's real feature-report length exactly as hidapi does on Windows.
+/// It mirrors OpenLinkHub's hardware-mode handoff using the HID descriptor's
+/// real feature-report length exactly as hidapi does on Windows. Commander Core
+/// PID 0C39 also receives the third volatile LCD report used by OpenLinkHub's
+/// normal Stop() path.
 ///
 /// The handoff is repeated briefly because the streaming thread may have one
 /// already-started USB frame in flight when the user presses Off. A late frame
@@ -304,6 +329,8 @@ pub fn restore_hardware_mode() -> Result<(), String> {
     let mut saw_stream_interface = false;
 
     for path in candidates {
+        let upper_path = path.to_ascii_uppercase();
+        let is_commander_core = upper_path.contains(COMMANDER_CORE_LCD_PID);
         let path_wide = to_wide(&path);
         let handle = unsafe {
             CreateFileW(
@@ -336,8 +363,8 @@ pub fn restore_hardware_mode() -> Result<(), String> {
         };
 
         diagnostics.push(format!(
-            "HID caps: output={} feature={} path={}",
-            caps.output_len, caps.feature_len, path
+            "HID caps: output={} feature={} commander_core={} path={}",
+            caps.output_len, caps.feature_len, is_commander_core, path
         ));
 
         // The desktop stream itself is made of 1024-byte reports. Target that
@@ -351,12 +378,17 @@ pub fn restore_hardware_mode() -> Result<(), String> {
 
         let mut interface_ok = true;
         // Retry long enough to outlive an already-started final JPEG transfer.
-        // These are idempotent mode commands and never modify persistent image
-        // storage, so repeating them is safe and avoids the old 100 ms race.
+        // These are idempotent live LCD commands and never modify persistent
+        // image storage, so repeating them is safe and avoids the old 100 ms race.
         for attempt in 1..=3 {
-            match unsafe { send_hardware_handoff(handle, caps) } {
+            match unsafe { send_hardware_handoff(handle, caps, is_commander_core) } {
                 Ok(()) => diagnostics.push(format!(
-                    "Hardware handoff attempt {attempt}: sent using {}-byte feature reports",
+                    "Hardware handoff attempt {attempt}: sent {} using {}-byte feature reports",
+                    if is_commander_core {
+                        "Commander Core normal 3-report sequence"
+                    } else {
+                        "2-report sequence"
+                    },
                     caps.feature_len
                 )),
                 Err(error) => {
@@ -405,11 +437,12 @@ pub fn restore_hardware_mode() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hardware_mode_packet_1, hardware_mode_packet_2};
+    use super::{commander_core_stop_packet, hardware_mode_packet_1, hardware_mode_packet_2};
 
     #[test]
     fn hardware_mode_packets_match_openlinkhub() {
         assert_eq!(hardware_mode_packet_1(), [0x03, 0x1e, 0x01, 0x01]);
         assert_eq!(hardware_mode_packet_2(), [0x03, 0x1d, 0x00, 0x01]);
+        assert_eq!(commander_core_stop_packet(), [0x03, 0x0b, 0x40, 0x01]);
     }
 }
