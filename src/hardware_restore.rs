@@ -26,6 +26,38 @@ const SUPPORTED_PIDS: &[&str] = &[
     "PID_0C5B",
 ];
 
+// The streaming transport writes 1024-byte output reports. Requiring an HID
+// interface with at least that output-report size prevents a different HID
+// interface on the same Corsair composite device from producing a false
+// "restore succeeded" result.
+const LCD_STREAM_REPORT_LEN: u16 = 1024;
+
+#[repr(C)]
+struct HidpCaps {
+    usage: u16,
+    usage_page: u16,
+    input_report_byte_length: u16,
+    output_report_byte_length: u16,
+    feature_report_byte_length: u16,
+    reserved: [u16; 17],
+    number_link_collection_nodes: u16,
+    number_input_button_caps: u16,
+    number_input_value_caps: u16,
+    number_input_data_indices: u16,
+    number_output_button_caps: u16,
+    number_output_value_caps: u16,
+    number_output_data_indices: u16,
+    number_feature_button_caps: u16,
+    number_feature_value_caps: u16,
+    number_feature_data_indices: u16,
+}
+
+#[derive(Clone, Copy)]
+struct ReportCaps {
+    output_len: u16,
+    feature_len: u16,
+}
+
 #[link(name = "cfgmgr32")]
 unsafe extern "system" {
     fn CM_Get_Device_Interface_List_SizeW(
@@ -67,6 +99,15 @@ unsafe extern "system" {
         report_buffer: *const u8,
         report_buffer_length: u32,
     ) -> u8;
+
+    fn HidD_GetPreparsedData(
+        hid_device_object: *mut c_void,
+        preparsed_data: *mut *mut c_void,
+    ) -> u8;
+
+    fn HidD_FreePreparsedData(preparsed_data: *mut c_void) -> u8;
+
+    fn HidP_GetCaps(preparsed_data: *const c_void, capabilities: *mut HidpCaps) -> i32;
 }
 
 fn to_wide(value: &str) -> Vec<u16> {
@@ -125,17 +166,96 @@ fn hardware_mode_packet_2() -> [u8; 4] {
     [0x03, 0x1d, 0x00, 0x01]
 }
 
-unsafe fn send_feature_exact(handle: *mut c_void, packet: &[u8; 4]) -> Result<(), String> {
-    // These are mode-switch reports only. Deliberately send exactly four bytes,
-    // matching the known-good hardware-mode sequence, and do not invoke any
-    // vendor API that can select/reset/rewrite persisted hardware image state.
-    let result = unsafe { HidD_SetFeature(handle, packet.as_ptr(), packet.len() as u32) };
-    if result == 0 {
+unsafe fn report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
+    let mut preparsed: *mut c_void = null_mut();
+    if unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } == 0 || preparsed.is_null() {
         return Err(format!(
-            "HidD_SetFeature failed with Windows error {}",
+            "HidD_GetPreparsedData failed with Windows error {}",
             unsafe { GetLastError() }
         ));
     }
+
+    let mut caps = HidpCaps {
+        usage: 0,
+        usage_page: 0,
+        input_report_byte_length: 0,
+        output_report_byte_length: 0,
+        feature_report_byte_length: 0,
+        reserved: [0; 17],
+        number_link_collection_nodes: 0,
+        number_input_button_caps: 0,
+        number_input_value_caps: 0,
+        number_input_data_indices: 0,
+        number_output_button_caps: 0,
+        number_output_value_caps: 0,
+        number_output_data_indices: 0,
+        number_feature_button_caps: 0,
+        number_feature_value_caps: 0,
+        number_feature_data_indices: 0,
+    };
+
+    let status = unsafe { HidP_GetCaps(preparsed, &mut caps) };
+    unsafe {
+        HidD_FreePreparsedData(preparsed);
+    }
+
+    // NTSTATUS values >= 0 indicate success.
+    if status < 0 {
+        return Err(format!("HidP_GetCaps failed with NTSTATUS 0x{:08x}", status as u32));
+    }
+
+    if caps.feature_report_byte_length < 4 {
+        return Err(format!(
+            "HID feature report length {} is too short for the LCD mode command",
+            caps.feature_report_byte_length
+        ));
+    }
+
+    Ok(ReportCaps {
+        output_len: caps.output_report_byte_length,
+        feature_len: caps.feature_report_byte_length,
+    })
+}
+
+unsafe fn send_feature_hidapi_style(
+    handle: *mut c_void,
+    packet: &[u8; 4],
+    feature_len: u16,
+) -> Result<(), String> {
+    // OpenLinkHub calls go-hid with a four-byte slice. On Windows, hidapi pads
+    // that slice to the HID descriptor's FeatureReportByteLength before calling
+    // HidD_SetFeature. Mirror that behaviour exactly rather than assuming 4 or
+    // 32 bytes.
+    let mut report = vec![0u8; feature_len as usize];
+    report[..packet.len()].copy_from_slice(packet);
+
+    let result = unsafe {
+        HidD_SetFeature(
+            handle,
+            report.as_ptr(),
+            report.len() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "HidD_SetFeature({} bytes) failed with Windows error {}",
+            report.len(),
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn send_hardware_handoff(
+    handle: *mut c_void,
+    caps: ReportCaps,
+) -> Result<(), String> {
+    let first = hardware_mode_packet_1();
+    let second = hardware_mode_packet_2();
+
+    unsafe { send_feature_hidapi_style(handle, &first, caps.feature_len) }?;
+    thread::sleep(Duration::from_millis(10));
+    unsafe { send_feature_hidapi_style(handle, &second, caps.feature_len) }?;
     Ok(())
 }
 
@@ -149,12 +269,16 @@ fn write_restore_diagnostics(lines: &[String]) {
 /// Returns a supported Corsair LCD from software-frame presentation to its
 /// already-configured hardware mode without touching the persisted image/GIF.
 ///
-/// OFF must be non-destructive: it never calls the iCUE DLL, never selects a
-/// hardware slot, never starts a boot/custom animation explicitly, never writes
-/// flash, and never changes LCD brightness. It only sends the two HID reports
-/// that leave software mode and hand presentation back to the device firmware.
+/// OFF is intentionally non-destructive. It does not call the iCUE DLL, select
+/// slots, play/reset animations, write flash, or alter hardware-image contents.
+/// It only mirrors OpenLinkHub's two hardware-mode reports, using the HID
+/// descriptor's real feature-report length exactly as hidapi does on Windows.
+///
+/// The handoff is repeated briefly because the streaming thread may have one
+/// already-started USB frame in flight when the user presses Off. A late frame
+/// must not be allowed to become the final presentation after the mode switch.
 pub fn restore_hardware_mode() -> Result<(), String> {
-    let candidates: Vec<String> = enumerate_hid_paths()
+    let mut candidates: Vec<String> = enumerate_hid_paths()
         .into_iter()
         .filter(|path| {
             let upper = path.to_ascii_uppercase();
@@ -166,11 +290,18 @@ pub fn restore_hardware_mode() -> Result<(), String> {
         return Err("No supported Corsair LCD found".into());
     }
 
-    let first = hardware_mode_packet_1();
-    let second = hardware_mode_packet_2();
+    // OpenLinkHub targets interface 0 for these LCD caps. Prefer MI_00 when the
+    // Windows composite HID path exposes an interface number, while retaining a
+    // capability-based fallback for products whose path does not contain MI_00.
+    candidates.sort_by_key(|path| {
+        let upper = path.to_ascii_uppercase();
+        if upper.contains("MI_00") { 0 } else { 1 }
+    });
+
     let mut succeeded = false;
     let mut last_error = String::new();
     let mut diagnostics = Vec::new();
+    let mut saw_stream_interface = false;
 
     for path in candidates {
         let path_wide = to_wide(&path);
@@ -194,41 +325,79 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             continue;
         }
 
-        let result = unsafe {
-            send_feature_exact(handle, &first).and_then(|_| {
-                thread::sleep(Duration::from_millis(10));
-                send_feature_exact(handle, &second)
-            })
+        let caps = match unsafe { report_caps(handle) } {
+            Ok(caps) => caps,
+            Err(error) => {
+                last_error = error.clone();
+                diagnostics.push(format!("Skipping HID interface: {error}"));
+                unsafe { CloseHandle(handle) };
+                continue;
+            }
         };
+
+        diagnostics.push(format!(
+            "HID caps: output={} feature={} path={}",
+            caps.output_len, caps.feature_len, path
+        ));
+
+        // The desktop stream itself is made of 1024-byte reports. Target that
+        // same HID interface for the mode handoff instead of accepting success
+        // from another interface belonging to the composite Corsair device.
+        if caps.output_len < LCD_STREAM_REPORT_LEN {
+            unsafe { CloseHandle(handle) };
+            continue;
+        }
+        saw_stream_interface = true;
+
+        let mut interface_ok = true;
+        // Retry long enough to outlive an already-started final JPEG transfer.
+        // These are idempotent mode commands and never modify persistent image
+        // storage, so repeating them is safe and avoids the old 100 ms race.
+        for attempt in 1..=3 {
+            match unsafe { send_hardware_handoff(handle, caps) } {
+                Ok(()) => diagnostics.push(format!(
+                    "Hardware handoff attempt {attempt}: sent using {}-byte feature reports",
+                    caps.feature_len
+                )),
+                Err(error) => {
+                    last_error = error.clone();
+                    diagnostics.push(format!("Hardware handoff attempt {attempt} failed: {error}"));
+                    interface_ok = false;
+                    break;
+                }
+            }
+            if attempt < 3 {
+                thread::sleep(Duration::from_millis(125));
+            }
+        }
 
         unsafe {
             CloseHandle(handle);
         }
 
-        match result {
-            Ok(()) => {
-                succeeded = true;
-                diagnostics.push(
-                    "Hardware restore: exact 4-byte mode-exit sequence sent; persisted image untouched"
-                        .into(),
-                );
-            }
-            Err(error) => {
-                last_error = error.clone();
-                diagnostics.push(format!("Hardware restore failed: {error}"));
-            }
+        if interface_ok {
+            succeeded = true;
+            diagnostics.push(
+                "Hardware restore complete; persisted image/GIF state was not modified".into(),
+            );
+            // One real streaming interface is enough; do not send LCD commands
+            // to unrelated HID interfaces on the same composite device.
+            break;
         }
+    }
+
+    if !saw_stream_interface {
+        diagnostics.push(
+            "No HID interface exposing the 1024-byte LCD streaming report was found".into(),
+        );
     }
 
     write_restore_diagnostics(&diagnostics);
 
     if succeeded {
-        // Give the firmware a brief moment to swap presentation back to the
-        // image/GIF it already has stored in hardware mode.
-        thread::sleep(Duration::from_millis(20));
         Ok(())
     } else if last_error.is_empty() {
-        Err("Unable to return Corsair LCD to hardware mode".into())
+        Err("Unable to identify the Corsair LCD streaming HID interface".into())
     } else {
         Err(last_error)
     }
@@ -239,7 +408,7 @@ mod tests {
     use super::{hardware_mode_packet_1, hardware_mode_packet_2};
 
     #[test]
-    fn hardware_mode_packets_are_exact_and_non_mutating() {
+    fn hardware_mode_packets_match_openlinkhub() {
         assert_eq!(hardware_mode_packet_1(), [0x03, 0x1e, 0x01, 0x01]);
         assert_eq!(hardware_mode_packet_2(), [0x03, 0x1d, 0x00, 0x01]);
     }
