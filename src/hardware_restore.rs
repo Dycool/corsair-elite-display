@@ -27,6 +27,12 @@ const SUPPORTED_PIDS: &[&str] = &[
 ];
 
 const COMMANDER_CORE_LCD_PID: &str = "PID_0C39";
+const COMMANDER_CORE_PARENT_PIDS: &[&str] = &["PID_0C32", "PID_0C1C"];
+
+// OpenLinkHub's Commander Core transport uses a 64-byte payload (+ report ID)
+// for PID 0C32 and a 96-byte payload (+ report ID) for PID 0C1C.
+const COMMANDER_CORE_0C32_OUTPUT_LEN: u16 = 65;
+const COMMANDER_CORE_0C1C_OUTPUT_LEN: u16 = 97;
 
 // The streaming transport writes 1024-byte output reports. Requiring an HID
 // interface with at least that output-report size prevents a different HID
@@ -89,6 +95,14 @@ unsafe extern "system" {
         flags_and_attributes: u32,
         template_file: *mut c_void,
     ) -> *mut c_void;
+
+    fn WriteFile(
+        handle: *mut c_void,
+        buffer: *const u8,
+        bytes_to_write: u32,
+        bytes_written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
 
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetLastError() -> u32;
@@ -177,7 +191,24 @@ fn commander_core_stop_packet() -> [u8; 4] {
     [0x03, 0x0b, 0x40, 0x01]
 }
 
-unsafe fn report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
+fn commander_core_parent_command() -> [u8; 4] {
+    // OpenLinkHub cmdHardwareMode. This changes only the Commander Core's live
+    // software/hardware operating state. It is not an LCD flash/config command.
+    [0x01, 0x03, 0x00, 0x01]
+}
+
+fn commander_core_parent_expected_output_len(path: &str) -> Option<u16> {
+    let upper = path.to_ascii_uppercase();
+    if upper.contains("PID_0C32") {
+        Some(COMMANDER_CORE_0C32_OUTPUT_LEN)
+    } else if upper.contains("PID_0C1C") {
+        Some(COMMANDER_CORE_0C1C_OUTPUT_LEN)
+    } else {
+        None
+    }
+}
+
+unsafe fn read_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
     let mut preparsed: *mut c_void = null_mut();
     if unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } == 0 || preparsed.is_null() {
         return Err(format!(
@@ -215,17 +246,21 @@ unsafe fn report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
         return Err(format!("HidP_GetCaps failed with NTSTATUS 0x{:08x}", status as u32));
     }
 
-    if caps.feature_report_byte_length < 4 {
-        return Err(format!(
-            "HID feature report length {} is too short for the LCD mode command",
-            caps.feature_report_byte_length
-        ));
-    }
-
     Ok(ReportCaps {
         output_len: caps.output_report_byte_length,
         feature_len: caps.feature_report_byte_length,
     })
+}
+
+unsafe fn lcd_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
+    let caps = unsafe { read_report_caps(handle) }?;
+    if caps.feature_len < 4 {
+        return Err(format!(
+            "HID feature report length {} is too short for the LCD mode command",
+            caps.feature_len
+        ));
+    }
+    Ok(caps)
 }
 
 unsafe fn send_feature_hidapi_style(
@@ -240,13 +275,7 @@ unsafe fn send_feature_hidapi_style(
     let mut report = vec![0u8; feature_len as usize];
     report[..packet.len()].copy_from_slice(packet);
 
-    let result = unsafe {
-        HidD_SetFeature(
-            handle,
-            report.as_ptr(),
-            report.len() as u32,
-        )
-    };
+    let result = unsafe { HidD_SetFeature(handle, report.as_ptr(), report.len() as u32) };
     if result == 0 {
         return Err(format!(
             "HidD_SetFeature({} bytes) failed with Windows error {}",
@@ -282,6 +311,144 @@ unsafe fn send_hardware_handoff(
     Ok(())
 }
 
+unsafe fn send_commander_core_parent_hardware_mode(
+    handle: *mut c_void,
+    caps: ReportCaps,
+    expected_output_len: u16,
+) -> Result<(), String> {
+    if caps.output_len != expected_output_len {
+        return Err(format!(
+            "Commander Core parent output report length {} did not match expected {}",
+            caps.output_len, expected_output_len
+        ));
+    }
+    if caps.output_len < 6 {
+        return Err("Commander Core parent output report is too short".into());
+    }
+
+    // OpenLinkHub transfer(cmdHardwareMode, nil, ...) builds a HID output report
+    // whose byte 0 is report ID 0, byte 1 is 0x08, and bytes 2..6 contain
+    // cmdHardwareMode (01 03 00 01). The remainder is zero-filled.
+    let mut report = vec![0u8; caps.output_len as usize];
+    report[1] = 0x08;
+    report[2..6].copy_from_slice(&commander_core_parent_command());
+
+    let mut written = 0u32;
+    let result = unsafe {
+        WriteFile(
+            handle,
+            report.as_ptr(),
+            report.len() as u32,
+            &mut written,
+            null_mut(),
+        )
+    };
+    if result == 0 || written != report.len() as u32 {
+        return Err(format!(
+            "Commander Core parent WriteFile failed (Windows error {}, wrote {written}/{})",
+            unsafe { GetLastError() },
+            report.len()
+        ));
+    }
+    Ok(())
+}
+
+fn restore_commander_core_parent_hardware_mode(diagnostics: &mut Vec<String>) -> Result<bool, String> {
+    let mut candidates: Vec<String> = enumerate_hid_paths()
+        .into_iter()
+        .filter(|path| {
+            let upper = path.to_ascii_uppercase();
+            upper.contains("VID_1B1C")
+                && COMMANDER_CORE_PARENT_PIDS
+                    .iter()
+                    .any(|pid| upper.contains(pid))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        diagnostics.push(
+            "Commander Core parent: no PID 0C32/0C1C HID device was found; parent-mode handoff skipped"
+                .into(),
+        );
+        return Ok(false);
+    }
+
+    candidates.sort_by_key(|path| {
+        let upper = path.to_ascii_uppercase();
+        if upper.contains("MI_00") { 0 } else { 1 }
+    });
+
+    let mut last_error = String::new();
+    for path in candidates {
+        let Some(expected_output_len) = commander_core_parent_expected_output_len(&path) else {
+            continue;
+        };
+        let path_wide = to_wide(&path);
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            last_error = format!(
+                "Commander Core parent could not be opened (Windows error {})",
+                unsafe { GetLastError() }
+            );
+            diagnostics.push(format!("{last_error}: path={path}"));
+            continue;
+        }
+
+        let caps = match unsafe { read_report_caps(handle) } {
+            Ok(caps) => caps,
+            Err(error) => {
+                last_error = error.clone();
+                diagnostics.push(format!(
+                    "Commander Core parent caps failed: {error} path={path}"
+                ));
+                unsafe { CloseHandle(handle) };
+                continue;
+            }
+        };
+
+        diagnostics.push(format!(
+            "Commander Core parent caps: output={} feature={} expected_output={} path={}",
+            caps.output_len, caps.feature_len, expected_output_len, path
+        ));
+
+        let result = unsafe {
+            send_commander_core_parent_hardware_mode(handle, caps, expected_output_len)
+        };
+        unsafe { CloseHandle(handle) };
+
+        match result {
+            Ok(()) => {
+                diagnostics.push(
+                    "Commander Core parent: sent runtime hardware-mode command; no persisted LCD configuration was changed"
+                        .into(),
+                );
+                return Ok(true);
+            }
+            Err(error) => {
+                last_error = error.clone();
+                diagnostics.push(format!("Commander Core parent handoff failed: {error}"));
+            }
+        }
+    }
+
+    if last_error.is_empty() {
+        Ok(false)
+    } else {
+        Err(last_error)
+    }
+}
+
 fn write_restore_diagnostics(lines: &[String]) {
     let _ = std::fs::write(
         std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
@@ -292,16 +459,11 @@ fn write_restore_diagnostics(lines: &[String]) {
 /// Returns a supported Corsair LCD from software-frame presentation to its
 /// already-configured hardware mode without touching the persisted image/GIF.
 ///
-/// OFF is intentionally non-destructive. It does not call the iCUE DLL, select
-/// slots, play/reset animations, write flash, or alter hardware-image contents.
-/// It mirrors OpenLinkHub's hardware-mode handoff using the HID descriptor's
-/// real feature-report length exactly as hidapi does on Windows. Commander Core
-/// PID 0C39 also receives the third volatile LCD report used by OpenLinkHub's
-/// normal Stop() path.
-///
-/// The handoff is repeated briefly because the streaming thread may have one
-/// already-started USB frame in flight when the user presses Off. A late frame
-/// must not be allowed to become the final presentation after the mode switch.
+/// OFF is intentionally non-destructive. It never selects hardware-image slots,
+/// plays/resets animations, writes flash, deletes screen configuration, or calls
+/// the proprietary iCUE DLL. It mirrors OpenLinkHub's normal Commander Core
+/// shutdown: first the LCD-cap handoff, then the parent controller's volatile
+/// software-to-hardware mode command.
 pub fn restore_hardware_mode() -> Result<(), String> {
     let mut candidates: Vec<String> = enumerate_hid_paths()
         .into_iter()
@@ -352,7 +514,7 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             continue;
         }
 
-        let caps = match unsafe { report_caps(handle) } {
+        let caps = match unsafe { lcd_report_caps(handle) } {
             Ok(caps) => caps,
             Err(error) => {
                 last_error = error.clone();
@@ -385,9 +547,9 @@ pub fn restore_hardware_mode() -> Result<(), String> {
                 Ok(()) => diagnostics.push(format!(
                     "Hardware handoff attempt {attempt}: sent {} using {}-byte feature reports",
                     if is_commander_core {
-                        "Commander Core normal 3-report sequence"
+                        "Commander Core normal 3-report LCD sequence"
                     } else {
-                        "2-report sequence"
+                        "2-report LCD sequence"
                     },
                     caps.feature_len
                 )),
@@ -403,11 +565,27 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             }
         }
 
-        unsafe {
-            CloseHandle(handle);
-        }
+        unsafe { CloseHandle(handle) };
 
         if interface_ok {
+            if is_commander_core {
+                match restore_commander_core_parent_hardware_mode(&mut diagnostics) {
+                    Ok(true) => {}
+                    Ok(false) => diagnostics.push(
+                        "Commander Core LCD handoff succeeded, but no matching parent controller mode command was sent"
+                            .into(),
+                    ),
+                    Err(error) => {
+                        last_error = error.clone();
+                        diagnostics.push(format!(
+                            "Commander Core LCD handoff succeeded, but parent hardware-mode restore failed: {error}"
+                        ));
+                        write_restore_diagnostics(&diagnostics);
+                        return Err(error);
+                    }
+                }
+            }
+
             succeeded = true;
             diagnostics.push(
                 "Hardware restore complete; persisted image/GIF state was not modified".into(),
@@ -437,12 +615,28 @@ pub fn restore_hardware_mode() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{commander_core_stop_packet, hardware_mode_packet_1, hardware_mode_packet_2};
+    use super::{
+        commander_core_parent_command, commander_core_parent_expected_output_len,
+        commander_core_stop_packet, hardware_mode_packet_1, hardware_mode_packet_2,
+    };
 
     #[test]
     fn hardware_mode_packets_match_openlinkhub() {
         assert_eq!(hardware_mode_packet_1(), [0x03, 0x1e, 0x01, 0x01]);
         assert_eq!(hardware_mode_packet_2(), [0x03, 0x1d, 0x00, 0x01]);
         assert_eq!(commander_core_stop_packet(), [0x03, 0x0b, 0x40, 0x01]);
+        assert_eq!(commander_core_parent_command(), [0x01, 0x03, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn commander_core_parent_report_lengths_match_openlinkhub() {
+        assert_eq!(
+            commander_core_parent_expected_output_len(r"\\?\HID#VID_1B1C&PID_0C32#x"),
+            Some(65)
+        );
+        assert_eq!(
+            commander_core_parent_expected_output_len(r"\\?\HID#VID_1B1C&PID_0C1C#x"),
+            Some(97)
+        );
     }
 }
