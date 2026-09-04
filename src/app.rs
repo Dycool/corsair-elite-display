@@ -1,22 +1,18 @@
-use std::ffi::{c_void, OsStr};
+use std::ffi::{OsStr, c_void};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
-};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::capture::{get_monitors, StreamController};
-use crate::off_screen::OffScreenController;
-use crate::settings::{set_startup, startup_enabled, Settings, ViewMode};
+use crate::capture::{StreamController, get_monitors};
+use crate::settings::{Settings, ViewMode, set_startup, startup_enabled};
 use crate::virtual_display::VirtualDisplayManager;
 
 pub const WINDOW_CLASS: &str = "CorsairEliteDisplayWindow";
@@ -29,8 +25,6 @@ const MENU_TOGGLE: usize = 200;
 const MENU_STARTUP: usize = 201;
 const MENU_EXIT: usize = 202;
 const MENU_SHOW_MOUSE: usize = 203;
-const MENU_OFF_SCREEN_SELECT: usize = 204;
-const MENU_OFF_SCREEN_HARDWARE: usize = 205;
 const MENU_VIEW_BASE: usize = 250;
 const MENU_FPS_BASE: usize = 300;
 const MENU_QUALITY_BASE: usize = 400;
@@ -56,39 +50,10 @@ fn copy_wide<const N: usize>(target: &mut [u16; N], value: &str) {
     target[..length].copy_from_slice(&value[..length]);
 }
 
-fn choose_off_screen_media(hwnd: HWND) -> Option<String> {
-    let mut file = [0u16; 32_768];
-    let filter = wide(
-        "Images and GIFs\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0",
-    );
-    let title = wide("Choose custom Off Screen image or GIF");
-
-    let mut dialog: OPENFILENAMEW = unsafe { zeroed() };
-    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
-    dialog.hwndOwner = hwnd;
-    dialog.lpstrFilter = filter.as_ptr();
-    dialog.lpstrFile = file.as_mut_ptr();
-    dialog.nMaxFile = file.len() as u32;
-    dialog.lpstrTitle = title.as_ptr();
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-
-    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
-        return None;
-    }
-
-    let length = file.iter().position(|value| *value == 0).unwrap_or(file.len());
-    if length == 0 {
-        None
-    } else {
-        Some(String::from_utf16_lossy(&file[..length]))
-    }
-}
-
 struct AppState {
     hwnd: HWND,
     settings: Settings,
     controller: StreamController,
-    off_screen: OffScreenController,
     taskbar_created: u32,
     icon_on: HICON,
     icon_off: HICON,
@@ -100,7 +65,6 @@ impl AppState {
         Self {
             hwnd: null_mut(),
             controller: StreamController::new(settings.clone()),
-            off_screen: OffScreenController::new(settings.clone()),
             settings,
             taskbar_created: 0,
             icon_on: null_mut(),
@@ -188,7 +152,6 @@ impl AppState {
         } else {
             VirtualDisplayManager::deactivate();
         }
-        self.sync_controllers();
         self.refresh_monitor();
         self.refresh_tray();
         unsafe { SetTimer(hwnd, TIMER_STATUS, 1_000, None) };
@@ -204,22 +167,9 @@ impl AppState {
         }
     }
 
-    fn sync_controllers(&self) {
-        self.controller.update_settings(self.settings.clone());
-        self.off_screen.update_settings(self.settings.clone());
-
-        if self.settings.streaming {
-            self.off_screen.set_running(false);
-            self.controller.set_running(true);
-        } else {
-            self.controller.set_running(false);
-            self.off_screen
-                .set_running(!self.settings.off_screen_media.trim().is_empty());
-        }
-    }
-
     fn apply(&mut self) {
-        self.sync_controllers();
+        self.controller.update_settings(self.settings.clone());
+        self.controller.set_running(self.settings.streaming);
         self.save();
     }
 
@@ -232,7 +182,7 @@ impl AppState {
             self.settings.streaming = false;
             self.controller.set_running(false);
             VirtualDisplayManager::deactivate();
-            self.apply();
+            self.save();
         } else if let Err(error) = VirtualDisplayManager::activate() {
             if !VirtualDisplayManager::is_admin() && !VirtualDisplayManager::is_ready() {
                 let msg = wide("Administrator privileges are required to install and configure the Virtual Screen driver.\n\nPlease run Corsair Elite Display as Administrator.");
@@ -283,10 +233,8 @@ impl AppState {
             } else {
                 format!("{APP_TITLE}\nOn")
             }
-        } else if self.settings.off_screen_media.trim().is_empty() {
-            format!("{APP_TITLE}\nOff · Cooler hardware screen")
         } else {
-            format!("{APP_TITLE}\nOff · Custom Image/GIF")
+            format!("{APP_TITLE}\nOff")
         };
         let icon = self.tray_data(&tooltip);
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon) };
@@ -342,20 +290,6 @@ impl AppState {
             self.settings.view_mode = *value;
             self.apply();
         }
-    }
-
-    fn choose_custom_off_screen(&mut self) {
-        if let Some(path) = choose_off_screen_media(self.hwnd) {
-            self.settings.off_screen_media = path;
-            self.apply();
-            self.refresh_tray();
-        }
-    }
-
-    fn use_cooler_hardware_screen(&mut self) {
-        self.settings.off_screen_media.clear();
-        self.apply();
-        self.refresh_tray();
     }
 
     fn tray_menu(&mut self) {
@@ -431,14 +365,6 @@ impl AppState {
             append_submenu(menu, rotation, "Rotation");
             append_submenu(menu, view, "View");
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
-            append_menu(menu, MENU_OFF_SCREEN_SELECT, "Set custom Off Screen (Image/GIF)...");
-            append_checked(
-                menu,
-                MENU_OFF_SCREEN_HARDWARE,
-                "Use cooler hardware screen",
-                self.settings.off_screen_media.trim().is_empty(),
-            );
-            AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_checked(menu, MENU_STARTUP, "Start with Windows", startup_enabled());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             append_menu(menu, MENU_EXIT, "Exit");
@@ -464,8 +390,6 @@ impl AppState {
                     self.settings.show_mouse = !self.settings.show_mouse;
                     self.apply();
                 }
-                MENU_OFF_SCREEN_SELECT => self.choose_custom_off_screen(),
-                MENU_OFF_SCREEN_HARDWARE => self.use_cooler_hardware_screen(),
                 MENU_STARTUP => {
                     if let Err(error) = set_startup(!startup_enabled()) {
                         show_error(self.hwnd, &error);
@@ -477,7 +401,9 @@ impl AppState {
                 id if (MENU_FPS_BASE..MENU_FPS_BASE + FPS_VALUES.len()).contains(&id) => {
                     self.set_fps(id - MENU_FPS_BASE)
                 }
-                id if (MENU_QUALITY_BASE..MENU_QUALITY_BASE + QUALITY_VALUES.len()).contains(&id) => {
+                id if (MENU_QUALITY_BASE..MENU_QUALITY_BASE + QUALITY_VALUES.len())
+                    .contains(&id) =>
+                {
                     self.set_quality(id - MENU_QUALITY_BASE)
                 }
                 id if (MENU_BRIGHTNESS_BASE..MENU_BRIGHTNESS_BASE + BRIGHTNESS_VALUES.len())
@@ -485,7 +411,9 @@ impl AppState {
                 {
                     self.set_brightness(id - MENU_BRIGHTNESS_BASE)
                 }
-                id if (MENU_ROTATION_BASE..MENU_ROTATION_BASE + ROTATION_VALUES.len()).contains(&id) => {
+                id if (MENU_ROTATION_BASE..MENU_ROTATION_BASE + ROTATION_VALUES.len())
+                    .contains(&id) =>
+                {
                     self.set_rotation(id - MENU_ROTATION_BASE)
                 }
                 id if (MENU_VIEW_BASE..MENU_VIEW_BASE + ViewMode::ALL.len()).contains(&id) => {
@@ -500,7 +428,6 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
-        self.off_screen.set_running(false);
         self.controller.set_running(false);
         VirtualDisplayManager::deactivate();
     }
