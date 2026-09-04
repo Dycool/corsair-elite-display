@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::Duration;
 
@@ -27,18 +27,9 @@ const SUPPORTED_PIDS: &[&str] = &[
 ];
 
 const COMMANDER_CORE_LCD_PID: &str = "PID_0C39";
-const COMMANDER_CORE_PARENT_PIDS: &[&str] = &["PID_0C32", "PID_0C1C"];
-
-// OpenLinkHub's Commander Core transport uses a 64-byte payload (+ report ID)
-// for PID 0C32 and a 96-byte payload (+ report ID) for PID 0C1C.
-const COMMANDER_CORE_0C32_OUTPUT_LEN: u16 = 65;
-const COMMANDER_CORE_0C1C_OUTPUT_LEN: u16 = 97;
-
-// The streaming transport writes 1024-byte output reports. Requiring an HID
-// interface with at least that output-report size prevents a different HID
-// interface on the same Corsair composite device from producing a false
-// "restore succeeded" result.
 const LCD_STREAM_REPORT_LEN: u16 = 1024;
+const ICUE_CC021_DLL: &str =
+    r"C:\Program Files\Corsair\Corsair iCUE5 Software\iD_BD_x64_cc021.dll";
 
 #[repr(C)]
 struct HidpCaps {
@@ -65,6 +56,15 @@ struct ReportCaps {
     output_len: u16,
     feature_len: u16,
 }
+
+type FnOpenDevice = unsafe extern "C" fn(
+    dev: *mut *mut c_void,
+    vid: u16,
+    pid: u16,
+    path: *const u16,
+) -> i32;
+
+type FnEnterHardwareMode = unsafe extern "C" fn(dev: *mut c_void) -> i32;
 
 #[link(name = "cfgmgr32")]
 unsafe extern "system" {
@@ -95,14 +95,6 @@ unsafe extern "system" {
         flags_and_attributes: u32,
         template_file: *mut c_void,
     ) -> *mut c_void;
-
-    fn WriteFile(
-        handle: *mut c_void,
-        buffer: *const u8,
-        bytes_to_write: u32,
-        bytes_written: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
 
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetLastError() -> u32;
@@ -183,32 +175,12 @@ fn hardware_mode_packet_2() -> [u8; 4] {
 }
 
 fn commander_core_stop_packet() -> [u8; 4] {
-    // OpenLinkHub's normal Commander Core Stop() sends this third LCD feature
-    // report after the two hardware-mode reports. Its dirty/minimal shutdown
-    // omits it. This is the live LCD brightness/refresh command; it does not
-    // select a hardware image slot, rewrite flash, or alter persisted image/GIF
-    // contents.
+    // OpenLinkHub's normal Commander Core Stop() sends this third live LCD
+    // report. It does not select an image slot or write persisted LCD storage.
     [0x03, 0x0b, 0x40, 0x01]
 }
 
-fn commander_core_parent_command() -> [u8; 4] {
-    // OpenLinkHub cmdHardwareMode. This changes only the Commander Core's live
-    // software/hardware operating state. It is not an LCD flash/config command.
-    [0x01, 0x03, 0x00, 0x01]
-}
-
-fn commander_core_parent_expected_output_len(path: &str) -> Option<u16> {
-    let upper = path.to_ascii_uppercase();
-    if upper.contains("PID_0C32") {
-        Some(COMMANDER_CORE_0C32_OUTPUT_LEN)
-    } else if upper.contains("PID_0C1C") {
-        Some(COMMANDER_CORE_0C1C_OUTPUT_LEN)
-    } else {
-        None
-    }
-}
-
-unsafe fn read_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
+unsafe fn report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
     let mut preparsed: *mut c_void = null_mut();
     if unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } == 0 || preparsed.is_null() {
         return Err(format!(
@@ -241,9 +213,14 @@ unsafe fn read_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
         HidD_FreePreparsedData(preparsed);
     }
 
-    // NTSTATUS values >= 0 indicate success.
     if status < 0 {
         return Err(format!("HidP_GetCaps failed with NTSTATUS 0x{:08x}", status as u32));
+    }
+    if caps.feature_report_byte_length < 4 {
+        return Err(format!(
+            "HID feature report length {} is too short for the LCD mode command",
+            caps.feature_report_byte_length
+        ));
     }
 
     Ok(ReportCaps {
@@ -252,26 +229,11 @@ unsafe fn read_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
     })
 }
 
-unsafe fn lcd_report_caps(handle: *mut c_void) -> Result<ReportCaps, String> {
-    let caps = unsafe { read_report_caps(handle) }?;
-    if caps.feature_len < 4 {
-        return Err(format!(
-            "HID feature report length {} is too short for the LCD mode command",
-            caps.feature_len
-        ));
-    }
-    Ok(caps)
-}
-
 unsafe fn send_feature_hidapi_style(
     handle: *mut c_void,
     packet: &[u8; 4],
     feature_len: u16,
 ) -> Result<(), String> {
-    // OpenLinkHub calls go-hid with a four-byte slice. On Windows, hidapi pads
-    // that slice to the HID descriptor's FeatureReportByteLength before calling
-    // HidD_SetFeature. Mirror that behaviour exactly rather than assuming 4 or
-    // 32 bytes.
     let mut report = vec![0u8; feature_len as usize];
     report[..packet.len()].copy_from_slice(packet);
 
@@ -299,10 +261,6 @@ unsafe fn send_hardware_handoff(
     unsafe { send_feature_hidapi_style(handle, &second, caps.feature_len) }?;
 
     if is_commander_core {
-        // PID 0C39 is the Commander Core LCD path. Match OpenLinkHub's normal
-        // Stop(), which sends one additional volatile LCD report after leaving
-        // software mode. This is intentionally not any of the Corsair DLL
-        // slot/configuration calls that previously disturbed the saved image.
         thread::sleep(Duration::from_millis(10));
         let third = commander_core_stop_packet();
         unsafe { send_feature_hidapi_style(handle, &third, caps.feature_len) }?;
@@ -311,142 +269,55 @@ unsafe fn send_hardware_handoff(
     Ok(())
 }
 
-unsafe fn send_commander_core_parent_hardware_mode(
-    handle: *mut c_void,
-    caps: ReportCaps,
-    expected_output_len: u16,
-) -> Result<(), String> {
-    if caps.output_len != expected_output_len {
-        return Err(format!(
-            "Commander Core parent output report length {} did not match expected {}",
-            caps.output_len, expected_output_len
-        ));
-    }
-    if caps.output_len < 6 {
-        return Err("Commander Core parent output report is too short".into());
-    }
-
-    // OpenLinkHub transfer(cmdHardwareMode, nil, ...) builds a HID output report
-    // whose byte 0 is report ID 0, byte 1 is 0x08, and bytes 2..6 contain
-    // cmdHardwareMode (01 03 00 01). The remainder is zero-filled.
-    let mut report = vec![0u8; caps.output_len as usize];
-    report[1] = 0x08;
-    report[2..6].copy_from_slice(&commander_core_parent_command());
-
-    let mut written = 0u32;
-    let result = unsafe {
-        WriteFile(
-            handle,
-            report.as_ptr(),
-            report.len() as u32,
-            &mut written,
-            null_mut(),
-        )
+/// Ask Corsair's own installed iCUE device library to perform only its runtime
+/// hardware-mode entry operation. This deliberately does not call any of the
+/// hardware-image update, animation-slot, screen-config, visibility, or flash
+/// functions used by the separate hardware-image editor.
+fn vendor_enter_hardware_mode() -> Result<(), String> {
+    let dll_path = to_wide(ICUE_CC021_DLL);
+    let module = unsafe {
+        windows_sys::Win32::System::LibraryLoader::LoadLibraryW(dll_path.as_ptr())
     };
-    if result == 0 || written != report.len() as u32 {
-        return Err(format!(
-            "Commander Core parent WriteFile failed (Windows error {}, wrote {written}/{})",
-            unsafe { GetLastError() },
-            report.len()
-        ));
+    if module.is_null() {
+        return Err("Corsair iCUE device library is not installed".into());
     }
+
+    unsafe {
+        let get_fn = |name: &[u8]| -> *mut c_void {
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress(module, name.as_ptr())
+                .map(|function| function as *mut c_void)
+                .unwrap_or(null_mut())
+        };
+
+        let open: Option<FnOpenDevice> =
+            std::mem::transmute(get_fn(b"iD_USB_open_device_cc021\0"));
+        let enter: Option<FnEnterHardwareMode> =
+            std::mem::transmute(get_fn(b"iD_USB_enter_hardware_mode_cc021\0"));
+
+        let Some(open) = open else {
+            return Err("Corsair iCUE library does not expose its device-open function".into());
+        };
+        let Some(enter) = enter else {
+            return Err("Corsair iCUE library does not expose its hardware-mode entry function".into());
+        };
+
+        let mut device: *mut c_void = null_mut();
+        let open_result = open(&mut device, 0x1b1c, 0x0c39, null());
+        if open_result != 0 || device.is_null() {
+            return Err(format!(
+                "Corsair iCUE library could not open the Commander Core LCD (result {open_result})"
+            ));
+        }
+
+        let enter_result = enter(device);
+        if enter_result != 0 {
+            return Err(format!(
+                "Corsair iCUE library hardware-mode entry failed (result {enter_result})"
+            ));
+        }
+    }
+
     Ok(())
-}
-
-fn restore_commander_core_parent_hardware_mode(diagnostics: &mut Vec<String>) -> Result<bool, String> {
-    let mut candidates: Vec<String> = enumerate_hid_paths()
-        .into_iter()
-        .filter(|path| {
-            let upper = path.to_ascii_uppercase();
-            upper.contains("VID_1B1C")
-                && COMMANDER_CORE_PARENT_PIDS
-                    .iter()
-                    .any(|pid| upper.contains(pid))
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        diagnostics.push(
-            "Commander Core parent: no PID 0C32/0C1C HID device was found; parent-mode handoff skipped"
-                .into(),
-        );
-        return Ok(false);
-    }
-
-    candidates.sort_by_key(|path| {
-        let upper = path.to_ascii_uppercase();
-        if upper.contains("MI_00") { 0 } else { 1 }
-    });
-
-    let mut last_error = String::new();
-    for path in candidates {
-        let Some(expected_output_len) = commander_core_parent_expected_output_len(&path) else {
-            continue;
-        };
-        let path_wide = to_wide(&path);
-        let handle = unsafe {
-            CreateFileW(
-                path_wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
-        };
-
-        if handle == INVALID_HANDLE_VALUE {
-            last_error = format!(
-                "Commander Core parent could not be opened (Windows error {})",
-                unsafe { GetLastError() }
-            );
-            diagnostics.push(format!("{last_error}: path={path}"));
-            continue;
-        }
-
-        let caps = match unsafe { read_report_caps(handle) } {
-            Ok(caps) => caps,
-            Err(error) => {
-                last_error = error.clone();
-                diagnostics.push(format!(
-                    "Commander Core parent caps failed: {error} path={path}"
-                ));
-                unsafe { CloseHandle(handle) };
-                continue;
-            }
-        };
-
-        diagnostics.push(format!(
-            "Commander Core parent caps: output={} feature={} expected_output={} path={}",
-            caps.output_len, caps.feature_len, expected_output_len, path
-        ));
-
-        let result = unsafe {
-            send_commander_core_parent_hardware_mode(handle, caps, expected_output_len)
-        };
-        unsafe { CloseHandle(handle) };
-
-        match result {
-            Ok(()) => {
-                diagnostics.push(
-                    "Commander Core parent: sent runtime hardware-mode command; no persisted LCD configuration was changed"
-                        .into(),
-                );
-                return Ok(true);
-            }
-            Err(error) => {
-                last_error = error.clone();
-                diagnostics.push(format!("Commander Core parent handoff failed: {error}"));
-            }
-        }
-    }
-
-    if last_error.is_empty() {
-        Ok(false)
-    } else {
-        Err(last_error)
-    }
 }
 
 fn write_restore_diagnostics(lines: &[String]) {
@@ -461,9 +332,9 @@ fn write_restore_diagnostics(lines: &[String]) {
 ///
 /// OFF is intentionally non-destructive. It never selects hardware-image slots,
 /// plays/resets animations, writes flash, deletes screen configuration, or calls
-/// the proprietary iCUE DLL. It mirrors OpenLinkHub's normal Commander Core
-/// shutdown: first the LCD-cap handoff, then the parent controller's volatile
-/// software-to-hardware mode command.
+/// any iCUE configuration routine. For Commander Core LCD PID 0C39, the normal
+/// HID handoff is followed only by Corsair's vendor-provided runtime
+/// enter-hardware-mode operation.
 pub fn restore_hardware_mode() -> Result<(), String> {
     let mut candidates: Vec<String> = enumerate_hid_paths()
         .into_iter()
@@ -477,9 +348,6 @@ pub fn restore_hardware_mode() -> Result<(), String> {
         return Err("No supported Corsair LCD found".into());
     }
 
-    // OpenLinkHub targets interface 0 for these LCD caps. Prefer MI_00 when the
-    // Windows composite HID path exposes an interface number, while retaining a
-    // capability-based fallback for products whose path does not contain MI_00.
     candidates.sort_by_key(|path| {
         let upper = path.to_ascii_uppercase();
         if upper.contains("MI_00") { 0 } else { 1 }
@@ -514,7 +382,7 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             continue;
         }
 
-        let caps = match unsafe { lcd_report_caps(handle) } {
+        let caps = match unsafe { report_caps(handle) } {
             Ok(caps) => caps,
             Err(error) => {
                 last_error = error.clone();
@@ -529,9 +397,6 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             caps.output_len, caps.feature_len, is_commander_core, path
         ));
 
-        // The desktop stream itself is made of 1024-byte reports. Target that
-        // same HID interface for the mode handoff instead of accepting success
-        // from another interface belonging to the composite Corsair device.
         if caps.output_len < LCD_STREAM_REPORT_LEN {
             unsafe { CloseHandle(handle) };
             continue;
@@ -539,9 +404,6 @@ pub fn restore_hardware_mode() -> Result<(), String> {
         saw_stream_interface = true;
 
         let mut interface_ok = true;
-        // Retry long enough to outlive an already-started final JPEG transfer.
-        // These are idempotent live LCD commands and never modify persistent
-        // image storage, so repeating them is safe and avoids the old 100 ms race.
         for attempt in 1..=3 {
             match unsafe { send_hardware_handoff(handle, caps, is_commander_core) } {
                 Ok(()) => diagnostics.push(format!(
@@ -569,20 +431,14 @@ pub fn restore_hardware_mode() -> Result<(), String> {
 
         if interface_ok {
             if is_commander_core {
-                match restore_commander_core_parent_hardware_mode(&mut diagnostics) {
-                    Ok(true) => {}
-                    Ok(false) => diagnostics.push(
-                        "Commander Core LCD handoff succeeded, but no matching parent controller mode command was sent"
+                match vendor_enter_hardware_mode() {
+                    Ok(()) => diagnostics.push(
+                        "Commander Core vendor handoff: Corsair iCUE runtime hardware-mode entry succeeded; persisted image/GIF configuration was not changed"
                             .into(),
                     ),
-                    Err(error) => {
-                        last_error = error.clone();
-                        diagnostics.push(format!(
-                            "Commander Core LCD handoff succeeded, but parent hardware-mode restore failed: {error}"
-                        ));
-                        write_restore_diagnostics(&diagnostics);
-                        return Err(error);
-                    }
+                    Err(error) => diagnostics.push(format!(
+                        "Commander Core vendor handoff unavailable: {error}; public HID handoff still completed"
+                    )),
                 }
             }
 
@@ -590,8 +446,6 @@ pub fn restore_hardware_mode() -> Result<(), String> {
             diagnostics.push(
                 "Hardware restore complete; persisted image/GIF state was not modified".into(),
             );
-            // One real streaming interface is enough; do not send LCD commands
-            // to unrelated HID interfaces on the same composite device.
             break;
         }
     }
@@ -615,28 +469,12 @@ pub fn restore_hardware_mode() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        commander_core_parent_command, commander_core_parent_expected_output_len,
-        commander_core_stop_packet, hardware_mode_packet_1, hardware_mode_packet_2,
-    };
+    use super::{commander_core_stop_packet, hardware_mode_packet_1, hardware_mode_packet_2};
 
     #[test]
     fn hardware_mode_packets_match_openlinkhub() {
         assert_eq!(hardware_mode_packet_1(), [0x03, 0x1e, 0x01, 0x01]);
         assert_eq!(hardware_mode_packet_2(), [0x03, 0x1d, 0x00, 0x01]);
         assert_eq!(commander_core_stop_packet(), [0x03, 0x0b, 0x40, 0x01]);
-        assert_eq!(commander_core_parent_command(), [0x01, 0x03, 0x00, 0x01]);
-    }
-
-    #[test]
-    fn commander_core_parent_report_lengths_match_openlinkhub() {
-        assert_eq!(
-            commander_core_parent_expected_output_len(r"\\?\HID#VID_1B1C&PID_0C32#x"),
-            Some(65)
-        );
-        assert_eq!(
-            commander_core_parent_expected_output_len(r"\\?\HID#VID_1B1C&PID_0C1C#x"),
-            Some(97)
-        );
     }
 }
