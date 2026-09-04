@@ -75,6 +75,7 @@ pub struct Settings {
     pub view_mode: ViewMode,
     pub show_mouse: bool,
     pub streaming: bool,
+    pub off_screen_media: String,
 }
 
 impl Default for Settings {
@@ -88,6 +89,7 @@ impl Default for Settings {
             view_mode: ViewMode::Native,
             show_mouse: true,
             streaming: true,
+            off_screen_media: String::new(),
         }
     }
 }
@@ -131,6 +133,7 @@ impl Settings {
                 "view" => result.view_mode = ViewMode::from_setting(value),
                 "show_mouse" => result.show_mouse = value.trim() != "false",
                 "streaming" => result.streaming = value.trim() != "false",
+                "off_screen_media" => result.off_screen_media = value.trim().to_owned(),
                 _ => {}
             }
         }
@@ -143,7 +146,7 @@ impl Settings {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let text = format!(
-            "monitor={}\nfps={}\nquality={}\nbrightness={}\nrotation={}\nview={}\nshow_mouse={}\nstreaming={}\n",
+            "monitor={}\nfps={}\nquality={}\nbrightness={}\nrotation={}\nview={}\nshow_mouse={}\nstreaming={}\noff_screen_media={}\n",
             self.monitor,
             self.fps,
             self.quality,
@@ -151,7 +154,8 @@ impl Settings {
             self.rotation,
             self.view_mode.setting_value(),
             self.show_mouse,
-            self.streaming
+            self.streaming,
+            self.off_screen_media
         );
         fs::write(path, text).map_err(|e| e.to_string())
     }
