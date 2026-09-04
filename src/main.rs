@@ -4,6 +4,7 @@ mod app;
 mod capture;
 mod corsair;
 mod driver_admin;
+mod hardware_media;
 mod hardware_restore;
 mod settings;
 mod virtual_display;
