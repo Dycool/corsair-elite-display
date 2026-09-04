@@ -6,6 +6,7 @@ mod corsair;
 mod driver_admin;
 mod hardware_media;
 mod hardware_restore;
+mod icue_probe;
 mod settings;
 mod virtual_display;
 
@@ -29,6 +30,19 @@ fn main() {
     // can remain open while Windows elevates a short-lived helper copy of us.
     if let Some(exit_code) = driver_admin::handle_admin_helper(&args) {
         std::process::exit(exit_code);
+    }
+
+    if args.iter().any(|arg| arg == "--probe-icue-flash-read") {
+        let result = icue_probe::run();
+        let status_path = std::env::temp_dir().join("corsair-elite-display-icue-probe-status.txt");
+        let _ = std::fs::write(
+            status_path,
+            match &result {
+                Ok(path) => format!("Read-only iCUE probe succeeded. Report: {}\n", path.display()),
+                Err(error) => format!("Read-only iCUE probe failed: {error}\n"),
+            },
+        );
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 
     if args.iter().any(|arg| arg == "--self-test") {
