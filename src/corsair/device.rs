@@ -323,17 +323,6 @@ impl CorsairLcdDevice {
         Ok(())
     }
 
-    fn send_black_fallback_frame(&self) -> Result<(), String> {
-        // Never leave a captured desktop frame frozen on the pump display while waiting for
-        // the LCD firmware to fall back to its saved hardware screen on its own.
-        let black_pixels = vec![0u8; 480 * 480 * 3];
-        let mut jpeg = Vec::with_capacity(8 * 1024);
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 60)
-            .encode(&black_pixels, 480, 480, ExtendedColorType::Rgb8)
-            .map_err(|error| format!("JPEG black fallback encoding failed: {error}"))?;
-        self.send_frame(&jpeg)
-    }
-
     fn send_feature_packet(&self, packet: &[u8; 32]) -> Result<(), String> {
         unsafe {
             let mut res = HidD_SetFeature(self.handle, packet.as_ptr(), packet.len() as u32);
@@ -360,77 +349,6 @@ impl CorsairLcdDevice {
         std::thread::sleep(std::time::Duration::from_millis(10));
         self.send_feature_packet(&p2)?;
         Ok(())
-    }
-
-    /// Releases the LCD streaming interface and switches the display back to hardware mode.
-    /// If switching to hardware mode fails, falls back to sending a black frame to avoid
-    /// leaving a desktop capture frozen on screen.
-    pub fn release_to_hardware(self) {
-        let hw_result = self.switch_to_hardware_mode();
-        let fallback_result = if hw_result.is_err() {
-            self.send_black_fallback_frame()
-        } else {
-            Ok(())
-        };
-        drop(self);
-
-        if let Err(error) = hw_result {
-            let log_msg = match fallback_result {
-                Err(fb) => format!("Hardware mode switch failed: {error}; fallback black frame failed: {fb}"),
-                Ok(()) => format!("Hardware mode switch failed: {error}; black fallback frame sent"),
-            };
-            let _ = std::fs::write(
-                std::env::temp_dir().join("corsair-elite-display-hardware-restore.txt"),
-                log_msg,
-            );
-        }
-    }
-
-    /// Attempts to locate any connected Corsair LCD and return it to hardware mode.
-    pub fn restore_hardware_mode() -> Result<(), String> {
-        let paths = Self::find_device_paths();
-        if paths.is_empty() {
-            return Err("No supported Corsair LCD found".into());
-        }
-        let mut succeeded = false;
-        let mut last_error = String::new();
-        for path in &paths {
-            let path_u16 = to_u16_vec(path);
-            let handle = unsafe {
-                CreateFileW(
-                    path_u16.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    null_mut(),
-                    OPEN_EXISTING,
-                    0,
-                    null_mut(),
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                continue;
-            }
-            let dev = Self {
-                handle,
-                product_name: String::new(),
-            };
-            match dev.switch_to_hardware_mode() {
-                Ok(()) => {
-                    succeeded = true;
-                }
-                Err(e) => {
-                    last_error = e;
-                }
-            }
-            drop(dev);
-        }
-        if succeeded {
-            Ok(())
-        } else if !last_error.is_empty() {
-            Err(last_error)
-        } else {
-            Err("Unable to open any Corsair LCD interface (check if iCUE has exclusive access)".into())
-        }
     }
 }
 
@@ -615,7 +533,7 @@ pub fn flash_hardware_image(path: &std::path::Path) -> Result<(), String> {
                         anim_buf.extend_from_slice(&1u16.to_le_bytes());   // frame count
                         anim_buf.extend_from_slice(&(jpeg_data.len() as u32).to_le_bytes());
                         anim_buf.extend_from_slice(&jpeg_data);
-                        
+
                         let crc = crc32(&jpeg_data);
 
                         update_anim(dev, anim_buf.as_ptr(), anim_buf.len() as u32, 0, crc);
