@@ -6,6 +6,7 @@ mod corsair;
 mod driver_admin;
 mod hardware_media;
 mod hardware_restore;
+mod icue_asset_probe;
 mod icue_probe;
 mod settings;
 mod virtual_display;
@@ -40,6 +41,19 @@ fn main() {
             match &result {
                 Ok(path) => format!("Read-only iCUE probe succeeded. Report: {}\n", path.display()),
                 Err(error) => format!("Read-only iCUE probe failed: {error}\n"),
+            },
+        );
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
+    if args.iter().any(|arg| arg == "--probe-icue-asset-readback") {
+        let result = icue_asset_probe::run();
+        let status_path = std::env::temp_dir().join("corsair-elite-display-cc021-asset-probe-status.txt");
+        let _ = std::fs::write(
+            status_path,
+            match &result {
+                Ok(path) => format!("cc021 asset probe succeeded. Report: {}\n", path.display()),
+                Err(error) => format!("cc021 asset probe failed: {error}\n"),
             },
         );
         std::process::exit(if result.is_ok() { 0 } else { 1 });
