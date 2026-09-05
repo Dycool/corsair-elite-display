@@ -46,8 +46,5 @@ jobs:
         with:
           draft: true
           generate_release_notes: true
-          files: |
-            release-assets/corsair-elite-display.exe
-            LICENSE
-            THIRD_PARTY_NOTICES.md
+          files: release-assets/corsair-elite-display.exe
           fail_on_unmatched_files: true
