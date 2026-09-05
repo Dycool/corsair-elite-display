@@ -4,10 +4,7 @@ mod app;
 mod capture;
 mod corsair;
 mod driver_admin;
-mod hardware_media;
 mod hardware_restore;
-mod icue_asset_probe;
-mod icue_probe;
 mod settings;
 mod virtual_display;
 
@@ -31,32 +28,6 @@ fn main() {
     // can remain open while Windows elevates a short-lived helper copy of us.
     if let Some(exit_code) = driver_admin::handle_admin_helper(&args) {
         std::process::exit(exit_code);
-    }
-
-    if args.iter().any(|arg| arg == "--probe-icue-flash-read") {
-        let result = icue_probe::run();
-        let status_path = std::env::temp_dir().join("corsair-elite-display-icue-probe-status.txt");
-        let _ = std::fs::write(
-            status_path,
-            match &result {
-                Ok(path) => format!("Read-only iCUE probe succeeded. Report: {}\n", path.display()),
-                Err(error) => format!("Read-only iCUE probe failed: {error}\n"),
-            },
-        );
-        std::process::exit(if result.is_ok() { 0 } else { 1 });
-    }
-
-    if args.iter().any(|arg| arg == "--probe-icue-asset-readback") {
-        let result = icue_asset_probe::run();
-        let status_path = std::env::temp_dir().join("corsair-elite-display-cc021-asset-probe-status.txt");
-        let _ = std::fs::write(
-            status_path,
-            match &result {
-                Ok(path) => format!("cc021 asset probe succeeded. Report: {}\n", path.display()),
-                Err(error) => format!("cc021 asset probe failed: {error}\n"),
-            },
-        );
-        std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 
     if args.iter().any(|arg| arg == "--self-test") {
@@ -92,13 +63,13 @@ fn main() {
         });
     }
 
-    // Strict single-instance guard: acquire mutex with initial ownership requested
+    // Strict single-instance guard: acquire mutex with initial ownership requested.
     let mutex_name = wide("CorsairEliteDisplay_SingleInstance");
     let mutex = unsafe { CreateMutexW(null_mut(), 1, mutex_name.as_ptr()) };
     let last_error = unsafe { GetLastError() };
 
     if mutex.is_null() || last_error == ERROR_ALREADY_EXISTS || last_error == ERROR_ACCESS_DENIED {
-        // Another instance is already running: signal it to show its tray status and exit immediately
+        // Another instance is already running: signal it to show its tray status and exit.
         let class_name = wide(app::WINDOW_CLASS);
         let existing = unsafe { FindWindowW(class_name.as_ptr(), null()) };
         if !existing.is_null() {
@@ -110,7 +81,7 @@ fn main() {
         return;
     }
 
-    // Ensure virtual monitor is cleaned up and hardware mode restored on panic
+    // Ensure virtual monitor is cleaned up and hardware mode restored on panic.
     std::panic::set_hook(Box::new(|_| {
         let _ = hardware_restore::restore_hardware_mode();
         virtual_display::VirtualDisplayManager::deactivate();
