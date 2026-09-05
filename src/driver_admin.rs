@@ -1,9 +1,7 @@
 use std::ffi::OsStr;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::Duration;
@@ -13,9 +11,8 @@ use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObj
 
 use crate::virtual_display::VirtualDisplayManager;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
-const SW_HIDE: i32 = 0;
+const SW_SHOWNORMAL: i32 = 1;
 const WAIT_TIMEOUT: u32 = 258;
 const ADMIN_INSTALL_ARG: &str = "--ced-admin-install-driver";
 const ADMIN_UNINSTALL_ARG: &str = "--ced-admin-uninstall-driver";
@@ -107,6 +104,18 @@ unsafe extern "system" {
 
 #[link(name = "newdev")]
 unsafe extern "system" {
+    fn DiInstallDriverW(
+        hwnd_parent: HWND,
+        inf_path: *const u16,
+        flags: u32,
+        need_reboot: *mut i32,
+    ) -> i32;
+    fn DiUninstallDriverW(
+        hwnd_parent: HWND,
+        inf_path: *const u16,
+        flags: u32,
+        need_reboot: *mut i32,
+    ) -> i32;
     fn UpdateDriverForPlugAndPlayDevicesW(
         hwnd_parent: HWND,
         hardware_id: *const u16,
@@ -136,19 +145,6 @@ fn admin_result_path() -> PathBuf {
     std::env::temp_dir().join(ADMIN_RESULT_FILE)
 }
 
-fn hidden_output(mut command: Command) -> Result<Output, String> {
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .output()
-        .map_err(|error| format!("Could not start {}: {error}", command.get_program().to_string_lossy()))
-}
-
-fn output_text(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    format!("{stdout}{stderr}")
-}
-
 fn copy_driver_configuration(temp_dir: &Path) -> Result<(), String> {
     let destination = PathBuf::from(r"C:\VirtualDisplayDriver");
     std::fs::create_dir_all(&destination)
@@ -168,14 +164,24 @@ fn copy_driver_configuration(temp_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn add_driver_package(inf_path: &Path) -> Result<(), String> {
-    let mut command = Command::new("pnputil.exe");
-    command.arg("/add-driver").arg(inf_path).arg("/install");
-    let output = hidden_output(command)?;
-    if output.status.success() {
-        Ok(())
+fn install_driver_package(inf_path: &Path) -> Result<bool, String> {
+    let inf = wide(inf_path.as_os_str());
+    let mut reboot_required = 0i32;
+    let result = unsafe {
+        DiInstallDriverW(
+            null_mut(),
+            inf.as_ptr(),
+            0,
+            &mut reboot_required,
+        )
+    };
+    if result == 0 {
+        Err(format!(
+            "Windows could not install the Virtual Display Driver package (error {}).",
+            unsafe { GetLastError() }
+        ))
     } else {
-        Err(format!("Driver package installation failed:\n{}", output_text(&output)))
+        Ok(reboot_required != 0)
     }
 }
 
@@ -272,12 +278,6 @@ fn create_root_device() -> Result<(), String> {
     result
 }
 
-fn restart_virtual_display_best_effort() {
-    let mut command = Command::new("pnputil.exe");
-    command.args(["/restart-device", r"Root\MttVDD"]);
-    let _ = hidden_output(command);
-}
-
 fn install_driver_as_admin() -> Result<(), String> {
     if !VirtualDisplayManager::is_admin() {
         return Err("The driver helper was not started with administrator privileges.".into());
@@ -287,19 +287,17 @@ fn install_driver_as_admin() -> Result<(), String> {
     copy_driver_configuration(&temp_dir)?;
     let inf_path = temp_dir.join("mttvdd.inf");
 
-    // Always stage/install the package. This also repairs a partially removed
-    // package instead of trusting stale display-enumeration state.
-    add_driver_package(&inf_path)?;
+    // Use Microsoft's documented device-installation APIs directly. Avoiding a
+    // hidden pnputil child process makes the privileged operation easier to
+    // audit and keeps the app's behavior closer to a normal Windows installer.
+    install_driver_package(&inf_path)?;
 
-    // First try to bind an existing Root\MttVDD node. This is the normal path
-    // after an uninstall performed by current versions of the app.
     let first_update = update_driver(&inf_path);
     thread::sleep(Duration::from_millis(500));
 
     if !VirtualDisplayManager::is_driver_installed() {
-        // Older versions removed the root-enumerated device itself. PnPUtil can
-        // stage the INF but cannot recreate such a node, so reconstruct it with
-        // SetupAPI and bind the embedded driver to it.
+        // Older releases could remove the root-enumerated node. Recreate it via
+        // SetupAPI only when Windows no longer exposes an MttVDD device.
         if let Err(update_error) = first_update {
             create_root_device().map_err(|create_error| {
                 format!(
@@ -308,8 +306,6 @@ fn install_driver_as_admin() -> Result<(), String> {
             })?;
             update_driver(&inf_path)?;
         } else {
-            // The update API reported success but GDI has not exposed the device
-            // yet. Wait briefly before creating a second node.
             for _ in 0..10 {
                 thread::sleep(Duration::from_millis(200));
                 if VirtualDisplayManager::is_driver_installed() {
@@ -323,8 +319,6 @@ fn install_driver_as_admin() -> Result<(), String> {
         }
     }
 
-    restart_virtual_display_best_effort();
-
     for _ in 0..40 {
         if VirtualDisplayManager::is_ready() {
             return Ok(());
@@ -335,36 +329,6 @@ fn install_driver_as_admin() -> Result<(), String> {
     Err("The driver package was installed, but Windows did not expose the Corsair Virtual Screen device after installation.".into())
 }
 
-fn published_driver_names(text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut result = Vec::new();
-
-    for (index, line) in lines.iter().enumerate() {
-        if !line.to_ascii_lowercase().contains("mttvdd.inf") {
-            continue;
-        }
-        let start = index.saturating_sub(10);
-        let end = (index + 10).min(lines.len().saturating_sub(1));
-        for candidate_line in &lines[start..=end] {
-            for token in candidate_line.split_whitespace() {
-                let token = token.trim_matches(|character: char| {
-                    !character.is_ascii_alphanumeric() && character != '.'
-                });
-                let lower = token.to_ascii_lowercase();
-                if lower.starts_with("oem")
-                    && lower.ends_with(".inf")
-                    && lower[3..lower.len() - 4].chars().all(|character| character.is_ascii_digit())
-                    && !result.iter().any(|existing: &String| existing.eq_ignore_ascii_case(token))
-                {
-                    result.push(token.to_string());
-                }
-            }
-        }
-    }
-
-    result
-}
-
 fn uninstall_driver_as_admin() -> Result<(), String> {
     if !VirtualDisplayManager::is_admin() {
         return Err("The driver helper was not started with administrator privileges.".into());
@@ -372,37 +336,30 @@ fn uninstall_driver_as_admin() -> Result<(), String> {
 
     VirtualDisplayManager::deactivate();
 
-    let mut enum_command = Command::new("pnputil.exe");
-    enum_command.arg("/enum-drivers");
-    let enum_output = hidden_output(enum_command)?;
-    if !enum_output.status.success() {
-        return Err(format!(
-            "Could not enumerate installed Windows drivers:\n{}",
-            output_text(&enum_output)
-        ));
-    }
-
-    let packages = published_driver_names(&String::from_utf8_lossy(&enum_output.stdout));
-    for package in packages {
-        let mut command = Command::new("pnputil.exe");
-        command
-            .arg("/delete-driver")
-            .arg(&package)
-            .args(["/uninstall", "/force"]);
-        let output = hidden_output(command)?;
-        if !output.status.success() {
+    if VirtualDisplayManager::is_driver_installed() {
+        let temp_dir = VirtualDisplayManager::prepare_driver_files()?;
+        let inf_path = temp_dir.join("mttvdd.inf");
+        let inf = wide(inf_path.as_os_str());
+        let mut reboot_required = 0i32;
+        let result = unsafe {
+            DiUninstallDriverW(
+                null_mut(),
+                inf.as_ptr(),
+                0,
+                &mut reboot_required,
+            )
+        };
+        if result == 0 {
             return Err(format!(
-                "Could not remove driver package {package}:\n{}",
-                output_text(&output)
+                "Windows could not uninstall the Virtual Display Driver package (error {}).",
+                unsafe { GetLastError() }
             ));
         }
     }
 
-    // Deliberately preserve the unbound Root\MttVDD device node. Removing the
-    // node is what made install -> uninstall -> install fail: PnPUtil stages an
-    // INF but does not create root-enumerated devices. Leaving the harmless,
-    // unbound node lets a future install rebind immediately; the install helper
-    // can also recreate it if an older version already removed it.
+    // Deliberately preserve the unbound Root\MttVDD device node. A future
+    // install can rebind it immediately, and the install path can recreate it
+    // if an older release has already removed it.
     let config_dir = PathBuf::from(r"C:\VirtualDisplayDriver");
     if config_dir.exists() {
         std::fs::remove_dir_all(&config_dir).map_err(|error| {
@@ -421,9 +378,9 @@ fn write_admin_result(result: &Result<(), String>) {
     let _ = std::fs::write(admin_result_path(), body);
 }
 
-/// Handles the hidden elevated helper mode before the normal single-instance
-/// tray application is created. Returns Some(exit_code) when an admin helper
-/// argument was present, otherwise None.
+/// Handles the elevated helper mode before the normal single-instance tray app
+/// is created. Returns Some(exit_code) when an admin-helper argument was
+/// present, otherwise None.
 pub fn handle_admin_helper(args: &[String]) -> Option<i32> {
     let action = if args.iter().any(|arg| arg == ADMIN_INSTALL_ARG) {
         Some(install_driver_as_admin as fn() -> Result<(), String>)
@@ -456,7 +413,7 @@ fn request_admin(action: &str, hwnd: HWND) -> Result<(), String> {
     info.lpFile = file.as_ptr();
     info.lpParameters = parameters.as_ptr();
     info.lpDirectory = null();
-    info.nShow = SW_HIDE;
+    info.nShow = SW_SHOWNORMAL;
 
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let error = unsafe { GetLastError() };
@@ -524,15 +481,4 @@ pub fn uninstall_driver_elevated(hwnd: HWND) -> Result<(), String> {
         return Err("The elevated uninstall completed, but the Corsair Virtual Screen still appears to be configured.".into());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::published_driver_names;
-
-    #[test]
-    fn finds_published_mttvdd_package_without_relying_on_localized_labels() {
-        let sample = "Published Name: oem42.inf\nOriginal Name: mttvdd.inf\nProvider Name: MikeTheTech\n";
-        assert_eq!(published_driver_names(sample), vec!["oem42.inf"]);
-    }
 }
