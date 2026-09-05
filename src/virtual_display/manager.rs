@@ -244,43 +244,7 @@ impl VirtualDisplayManager {
         }
 
         if !Self::is_driver_installed() {
-            if !Self::is_admin() {
-                return Err("The Corsair Virtual Screen driver is not installed.\n\nAdministrator privileges are required to install it.\nPlease right-click Corsair Elite Display and choose 'Run as administrator' once.".into());
-            }
-            Self::install_embedded_driver()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn install_embedded_driver() -> Result<(), String> {
-        if !Self::is_admin() {
-            return Err("Administrator privileges are required to install the Virtual Screen driver.\n\nPlease run the application as Administrator.".into());
-        }
-
-        let temp_dir = std::env::temp_dir().join("corsair_vdd");
-        let _ = std::fs::create_dir_all(&temp_dir);
-
-        let inf_path = temp_dir.join("mttvdd.inf");
-        let cat_path = temp_dir.join("MttVDD.cat");
-        let dll_path = temp_dir.join("MttVDD.dll");
-
-        std::fs::write(&inf_path, DRIVER_INF)
-            .map_err(|e| format!("Could not unpack driver inf: {e}"))?;
-        std::fs::write(&cat_path, DRIVER_CAT)
-            .map_err(|e| format!("Could not unpack driver cat: {e}"))?;
-        std::fs::write(&dll_path, DRIVER_DLL)
-            .map_err(|e| format!("Could not unpack driver dll: {e}"))?;
-
-        let output = Command::new("pnputil.exe")
-            .args(["/add-driver", inf_path.to_str().unwrap_or(""), "/install"])
-            .output()
-            .map_err(|e| format!("Could not run pnputil: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("Driver installation failed:\n{}{}", stdout, stderr));
+            return Err("The Corsair Virtual Screen driver is not installed.\n\nUse Corsair Elite Display's normal driver installation prompt so Windows can request administrator permission explicitly.".into());
         }
 
         Ok(())
@@ -310,53 +274,8 @@ impl VirtualDisplayManager {
         Ok(temp_dir)
     }
 
-    #[allow(dead_code)]
-    pub fn restart_device() -> Result<(), String> {
-        if !Self::is_admin() {
-            return Err("Administrator privileges are required to restart the Virtual Display device.\n\nPlease run Corsair Elite Display as Administrator.".into());
-        }
-
-        // Restart all MttVDD / Virtual Display Driver instances dynamically
-        if let Ok(output) = Command::new("pnputil.exe")
-            .args(["/enum-devices", "/class", "Display"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let mut current_id = String::new();
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(id) = trimmed.strip_prefix("Instance ID:") {
-                    current_id = id.trim().to_string();
-                } else if (trimmed.contains("Virtual Display Driver") || trimmed.contains("MikeTheTech") || trimmed.contains("MttVDD"))
-                    && !current_id.is_empty()
-                {
-                    let _ = Command::new("pnputil.exe")
-                        .args(["/restart-device", &current_id])
-                        .output();
-                }
-            }
-        }
-        let _ = Command::new("pnputil.exe")
-            .args(["/restart-device", r"Root\MttVDD"])
-            .output();
-
-        // Brief delay for PnP reload
-        thread::sleep(Duration::from_millis(500));
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn configure_and_restart() -> Result<(), String> {
-        Self::ensure_configured()?;
-        if Self::is_admin() {
-            Self::restart_device()?;
-        }
-        Ok(())
-    }
-
     pub fn activate() -> Result<(), String> {
-        let _ = Self::ensure_configured();
+        Self::ensure_configured()?;
 
         if monitor_attached() {
             return Ok(());
@@ -373,9 +292,7 @@ impl VirtualDisplayManager {
         }
 
         if !Self::is_driver_installed() {
-            if !Self::is_admin() {
-                return Err("Virtual Screen is not installed.\n\nPlease run Corsair Elite Display as Administrator to install and configure it.".into());
-            }
+            return Err("Virtual Screen is not installed.\n\nUse the app's driver installation prompt to install and configure it.".into());
         }
 
         Err("The Corsair Virtual Screen is not available. Please verify the display driver is installed.".into())
