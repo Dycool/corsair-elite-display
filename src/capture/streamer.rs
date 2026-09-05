@@ -525,8 +525,25 @@ impl StreamController {
         }
     }
 
-    pub fn set_running(&self, running: bool) {
+    pub fn set_running(&mut self, running: bool) {
         let changed = self.running.swap(running, Ordering::AcqRel) != running;
+        if !running {
+            // Joining is the ownership barrier: no frame or device cleanup can
+            // run after the caller begins OFF playback or hardware handoff.
+            self.shutdown.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        } else if self.worker.is_none() {
+            self.shutdown.store(false, Ordering::Release);
+            let running = Arc::clone(&self.running);
+            let shutdown = Arc::clone(&self.shutdown);
+            let settings = Arc::clone(&self.settings);
+            let stats = Arc::clone(&self.stats);
+            self.worker = Some(thread::spawn(move || {
+                stream_loop(running, shutdown, settings, stats);
+            }));
+        }
         if changed && let Ok(mut current) = self.stats.lock() {
             current.fps = 0.0;
             current.latency_ms = 0.0;
@@ -603,22 +620,17 @@ fn stream_loop(
 
         // Detect transitions between Off and On
         if is_running != was_running {
-            let turned_off = was_running && !is_running;
             was_running = is_running;
             capture.reset_source();
             prev_pixels.clear();
             if is_running {
                 force_fresh_frames = 30;
                 set_status(&stats, "Resuming second screen...");
-            } else if turned_off && device.is_none() {
-                let _ = CorsairLcdDevice::restore_hardware_mode();
             }
         }
 
         if !is_running {
-            if let Some(connected) = device.take() {
-                connected.release_to_hardware();
-            }
+            drop(device.take());
             capture.reset_source();
             prev_pixels.clear();
             set_status(&stats, "Off");
@@ -829,7 +841,58 @@ fn stream_loop(
         }
     }
 
-    if let Some(connected) = device.take() {
-        connected.release_to_hardware();
+    // The UI owns the OFF handoff after joining this worker. Closing the
+    // streaming handle here must not issue mode commands or fallback frames.
+    drop(device.take());
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn assert_stop_joins_worker(initially_running: bool) {
+        let running = Arc::new(AtomicBool::new(initially_running));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_events = Arc::clone(&events);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            while !worker_shutdown.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Model an already-started transfer finishing, then handle cleanup.
+            let mut events = worker_events.lock().unwrap();
+            events.push("last frame completed");
+            events.push("stream handle closed");
+        });
+        ready_rx.recv().unwrap();
+        let mut controller = StreamController {
+            running,
+            shutdown,
+            settings: Arc::new(Mutex::new(Settings::default())),
+            stats: Arc::new(Mutex::new(StreamStats::default())),
+            worker: Some(worker),
+        };
+        controller.set_running(false);
+        events.lock().unwrap().push("OFF handoff");
+        assert_eq!(*events.lock().unwrap(), vec![
+            "last frame completed", "stream handle closed", "OFF handoff"
+        ]);
+        assert!(controller.worker.is_none());
+        // Repeated stop must not create a new worker or perform more cleanup.
+        controller.set_running(false);
+        assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn off_waits_for_final_frame_and_handle_cleanup() {
+        assert_stop_joins_worker(true);
+    }
+
+    #[test]
+    fn off_also_joins_an_initially_idle_worker() {
+        assert_stop_joins_worker(false);
     }
 }

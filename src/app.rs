@@ -163,13 +163,13 @@ impl AppState {
     }
 
     fn show_off_display(&mut self) {
+        self.controller.set_running(false);
         if !self.hardware_playback.start() {
             let _ = crate::hardware_restore::restore_hardware_mode();
         }
     }
 
     fn restore_hardware_after_stream_stop(&mut self) {
-        std::thread::sleep(std::time::Duration::from_millis(150));
         self.show_off_display();
     }
 
@@ -560,7 +560,6 @@ impl AppState {
             self.settings.streaming = false;
             self.controller.set_running(false);
             self.save();
-            std::thread::sleep(std::time::Duration::from_millis(150));
         }
         let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
@@ -600,7 +599,6 @@ impl Drop for AppState {
         unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
         self.hardware_playback.stop();
         self.controller.set_running(false);
-        std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
     }
@@ -744,6 +742,5 @@ pub fn run(_background: bool) {
             DispatchMessageW(&message);
         }
         drop(Box::from_raw(state));
-        let _ = crate::hardware_restore::restore_hardware_mode();
     }
 }
