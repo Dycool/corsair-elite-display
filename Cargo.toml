@@ -4,6 +4,9 @@ version = "1.0.0"
 edition = "2024"
 authors = ["Diogo"]
 description = "A lightweight Windows tray app that turns a Corsair Elite LCD into a real second display"
+license = "MIT"
+repository = "https://github.com/Dycool/corsair-elite-display"
+readme = "README.md"
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }

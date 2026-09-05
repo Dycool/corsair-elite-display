@@ -1,7 +1,10 @@
 /target
 **/*.rs.bk
 *.exe
-!Dependencies/devcon.exe
 *.pdb
+*.log
+.env
+.env.*
+!.env.example
 .vscode/
 .idea/
