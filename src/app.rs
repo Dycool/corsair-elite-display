@@ -12,7 +12,6 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::{StreamController, get_monitors};
-use crate::hardware_media::{HardwareMedia, HardwarePlayback};
 use crate::settings::{Settings, ViewMode, set_startup, startup_enabled};
 use crate::virtual_display::VirtualDisplayManager;
 
@@ -57,7 +56,6 @@ struct AppState {
     hwnd: HWND,
     settings: Settings,
     controller: StreamController,
-    hardware_playback: HardwarePlayback,
     taskbar_created: u32,
     icon_on: HICON,
     icon_off: HICON,
@@ -66,11 +64,9 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         let settings = Settings::load();
-        let cached_hardware_media = HardwareMedia::load_cached().ok().flatten();
         Self {
             hwnd: null_mut(),
             controller: StreamController::new(settings.clone()),
-            hardware_playback: HardwarePlayback::new(cached_hardware_media),
             settings,
             taskbar_created: 0,
             icon_on: null_mut(),
@@ -125,17 +121,17 @@ impl AppState {
         }
 
         if self.settings.streaming {
-            self.hardware_playback.stop();
             if let Err(error) = VirtualDisplayManager::activate() {
                 self.settings.streaming = false;
                 self.controller.set_running(false);
                 self.save();
-                self.show_off_display();
+                let _ = crate::hardware_restore::restore_hardware_mode();
                 show_error(hwnd, &error);
             }
         } else {
+            self.controller.set_running(false);
             VirtualDisplayManager::deactivate();
-            self.show_off_display();
+            let _ = crate::hardware_restore::restore_hardware_mode();
         }
         self.refresh_monitor();
         self.refresh_tray();
@@ -162,27 +158,20 @@ impl AppState {
         let _ = self.settings.save();
     }
 
-    fn show_off_display(&mut self) {
-        self.controller.set_running(false);
-        if !self.hardware_playback.start() {
-            let _ = crate::hardware_restore::restore_hardware_mode();
-        }
-    }
-
     fn restore_hardware_after_stream_stop(&mut self) {
-        self.show_off_display();
+        // set_running(false) joins the worker, so no captured frame can be
+        // submitted after the hardware-mode handoff begins.
+        self.controller.set_running(false);
+        let _ = crate::hardware_restore::restore_hardware_mode();
     }
 
     fn toggle(&mut self) {
         if self.settings.streaming {
             self.settings.streaming = false;
-            self.controller.set_running(false);
             self.save();
             self.restore_hardware_after_stream_stop();
             VirtualDisplayManager::deactivate();
         } else {
-            self.hardware_playback.stop();
-
             if !VirtualDisplayManager::is_ready() {
                 let msg = wide(
                     "The Corsair Virtual Screen driver is not installed or configured.\n\nAdministrator privileges are required to install it.\n\nClick OK and Corsair Elite Display itself will request administrator permission to install the driver."
@@ -197,7 +186,7 @@ impl AppState {
                         unsafe {
                             MessageBoxW(self.hwnd, err_msg.as_ptr(), wide("Installation Error").as_ptr(), MB_OK | MB_ICONERROR);
                         }
-                        self.show_off_display();
+                        self.restore_hardware_after_stream_stop();
                         return;
                     }
                     let ok_msg = wide("The Virtual Screen driver was successfully installed and configured!");
@@ -205,14 +194,14 @@ impl AppState {
                         MessageBoxW(self.hwnd, ok_msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
                     }
                 } else {
-                    self.show_off_display();
+                    self.restore_hardware_after_stream_stop();
                     return;
                 }
             }
 
             if let Err(error) = VirtualDisplayManager::activate() {
                 show_error(self.hwnd, &error);
-                self.show_off_display();
+                self.restore_hardware_after_stream_stop();
                 return;
             }
 
@@ -492,45 +481,17 @@ impl AppState {
         let path_str = String::from_utf16_lossy(&file_buf[..len]);
         let path = std::path::Path::new(&path_str);
 
-        self.hardware_playback.stop();
         let flash_res = crate::corsair::flash_hardware_image(path);
 
         match flash_res {
             Ok(()) => {
-                match HardwareMedia::from_path(path) {
-                    Ok(media) => {
-                        let cache_warning = media.persist_cache().err();
-                        self.hardware_playback.replace_media(media);
-                        self.show_off_display();
-
-                        let text = if let Some(warning) = cache_warning {
-                            format!(
-                                "Hardware image/GIF was applied successfully and is active in RAM for Off mode.\n\nThe persistent app cache could not be saved, so it will need to be selected again after restarting the app:\n\n{warning}"
-                            )
-                        } else {
-                            "Hardware image/GIF has been successfully applied to your cooler screen and cached for Off mode!".to_string()
-                        };
-                        let msg = wide(&text);
-                        let caption = wide("Corsair Elite Display");
-                        unsafe {
-                            MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                        }
-                    }
-                    Err(media_error) => {
-                        self.hardware_playback.clear_media();
-                        let _ = crate::hardware_restore::restore_hardware_mode();
-                        let msg = wide(&format!(
-                            "Hardware image/GIF was applied to the cooler, but Corsair Elite Display could not prepare its RAM copy for Off mode:\n\n{media_error}"
-                        ));
-                        let caption = wide("Corsair Elite Display - Cache Warning");
-                        unsafe {
-                            MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONWARNING);
-                        }
-                    }
+                let msg = wide("Hardware image/GIF has been successfully applied to your cooler screen!");
+                let caption = wide("Corsair Elite Display");
+                unsafe {
+                    MessageBoxW(self.hwnd, msg.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
             }
             Err(err) => {
-                self.show_off_display();
                 let msg = wide(&format!("Failed to apply hardware image:\n\n{err}"));
                 let caption = wide("Corsair Elite Display - Error");
                 unsafe {
@@ -555,12 +516,11 @@ impl AppState {
             return;
         }
 
-        self.hardware_playback.stop();
         if self.settings.streaming {
             self.settings.streaming = false;
-            self.controller.set_running(false);
             self.save();
         }
+        self.controller.set_running(false);
         let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
 
@@ -597,7 +557,6 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
-        self.hardware_playback.stop();
         self.controller.set_running(false);
         let _ = crate::hardware_restore::restore_hardware_mode();
         VirtualDisplayManager::deactivate();
