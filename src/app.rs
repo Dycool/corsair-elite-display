@@ -35,7 +35,11 @@ const MENU_ROTATION_BASE: usize = 600;
 
 const FPS_VALUES: [u32; 4] = [10, 15, 20, 30];
 const QUALITY_VALUES: [u8; 4] = [55, 65, 75, 85];
-const BRIGHTNESS_VALUES: [u8; 4] = [25, 50, 75, 100];
+// The capture pipeline scales encoded RGB values, so the old 25/50/75 settings
+// look approximately like 0/25/50% luminance. Preserve those proven levels,
+// keep 100% untouched, and add an interpolated level for a useful 75% step.
+const BRIGHTNESS_VALUES: [u8; 5] = [25, 50, 75, 88, 100];
+const BRIGHTNESS_LABELS: [u8; 5] = [0, 25, 50, 75, 100];
 const ROTATION_VALUES: [u16; 4] = [0, 90, 180, 270];
 
 fn wide(value: &str) -> Vec<u16> {
@@ -361,12 +365,16 @@ impl AppState {
                     self.settings.quality == *value,
                 );
             }
-            for (index, value) in BRIGHTNESS_VALUES.iter().enumerate() {
+            for (index, (&value, &label)) in BRIGHTNESS_VALUES
+                .iter()
+                .zip(BRIGHTNESS_LABELS.iter())
+                .enumerate()
+            {
                 append_checked(
                     brightness,
                     MENU_BRIGHTNESS_BASE + index,
-                    &format!("{value}%"),
-                    self.settings.brightness == *value,
+                    &format!("{label}%"),
+                    self.settings.brightness == value,
                 );
             }
             for (index, value) in ROTATION_VALUES.iter().enumerate() {
