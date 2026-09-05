@@ -21,18 +21,11 @@ jobs:
         run: cargo test --locked
       - name: Build release executable
         run: cargo build --release --locked
-      - name: Generate SHA-256 checksum
-        shell: pwsh
-        run: |
-          $hash = (Get-FileHash target/release/corsair-elite-display.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  corsair-elite-display.exe" | Set-Content -Encoding ascii target/release/SHA256SUMS.txt
       - name: Upload Windows executable
         uses: actions/upload-artifact@v7
         with:
           name: corsair-elite-display-windows-x64
-          path: |
-            target/release/corsair-elite-display.exe
-            target/release/SHA256SUMS.txt
+          path: target/release/corsair-elite-display.exe
           if-no-files-found: error
 
   release:
@@ -55,7 +48,6 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/corsair-elite-display.exe
-            release-assets/SHA256SUMS.txt
             LICENSE
             THIRD_PARTY_NOTICES.md
           fail_on_unmatched_files: true
