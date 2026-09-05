@@ -10,6 +10,8 @@ const REPORT_FILE: &str = "corsair-elite-display-cc021-asset-probe.txt";
 const VID_CORSAIR: u16 = 0x1b1c;
 const PID_COMMANDER_CORE_LCD: u16 = 0x0c39;
 const HARDWARE_BACKGROUND_ASSET: u8 = 2;
+// wait_event removes the HID report ID: 1 type + 4 length + 506 payload.
+const EVENT_SIZE: usize = 511;
 
 // Signatures below are recovered from the uploaded cc021 DLL itself. This probe
 // deliberately uses only query/receive operations. The vendor open/close calls
@@ -59,7 +61,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn parse_event(event: &[u8; 512]) -> String {
+fn parse_event(event: &[u8; EVENT_SIZE]) -> String {
     let event_type = event[0];
     let declared = u32::from_le_bytes([event[1], event[2], event[3], event[4]]) as usize;
     let available = event.len() - 5;
@@ -90,6 +92,7 @@ pub fn run() -> Result<PathBuf, String> {
     lines.push("Corsair Elite Display - cc021 asset readback probe".to_string());
     lines.push("Persistent storage writes: NONE".to_string());
     lines.push("Unknown/guessed opcodes: NONE".to_string());
+    lines.push("Asset readback: UNPROVEN; an input event is not evidence of stored media.".to_string());
     lines.push(
         "Note: vendor open/close toggles the volatile LCD software/hardware session state."
             .to_string(),
@@ -103,7 +106,9 @@ pub fn run() -> Result<PathBuf, String> {
         return Err(format!("Could not load {ICUE_CC021_DLL}"));
     }
 
-    let result = unsafe {
+    // Keep early errors local so every failure writes the accumulated report
+    // and releases the library after all function pointers are finished.
+    let result = (|| unsafe {
         let open: Option<FnOpenDevice> = std::mem::transmute(proc(
             module,
             b"iD_USB_open_device_cc021\0",
@@ -209,11 +214,12 @@ pub fn run() -> Result<PathBuf, String> {
         lines.push(format!("receive_input_data: result={receive_result}"));
 
         if receive_result == 0 {
-            let mut event = [0u8; 512];
+            let mut event = [0u8; EVENT_SIZE];
             let wait_result = wait_event(device, event.as_mut_ptr(), 1_000);
             lines.push(format!("wait_event: result={wait_result}"));
             if wait_result == 0 {
                 lines.push(parse_event(&event));
+                lines.push(format!("event_bytes[{}]={}", event.len(), hex(&event)));
                 let ack_result = receive_ack(device);
                 lines.push(format!("receive_input_data_ack: result={ack_result}"));
             }
@@ -225,7 +231,12 @@ pub fn run() -> Result<PathBuf, String> {
             !device.is_null()
         ));
         Ok::<(), String>(())
-    };
+    })();
+
+    unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+    if let Err(error) = &result {
+        lines.push(format!("error: {error}"));
+    }
 
     let output = std::env::temp_dir().join(REPORT_FILE);
     let write_result = std::fs::write(&output, format!("{}\n", lines.join("\n")));
@@ -236,4 +247,28 @@ pub fn run() -> Result<PathBuf, String> {
     }
     write_result.map_err(|error| format!("Could not write {}: {error}", output.display()))?;
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_preview_uses_vendor_structure_without_report_id() {
+        let mut event = [0u8; EVENT_SIZE];
+        event[0] = 0x12;
+        event[1..5].copy_from_slice(&3u32.to_le_bytes());
+        event[5..8].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        assert_eq!(parse_event(&event),
+            "event_type=0x12 declared_payload=3 payload_preview[3]=ff d8 ff");
+    }
+
+    #[test]
+    fn oversized_declared_length_keeps_preview_bounded() {
+        let mut event = [0u8; EVENT_SIZE];
+        event[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_event(&event), format!(
+            "event_type=0x00 declared_payload=4294967295 payload_preview[96]={}",
+            hex(&[0; 96])));
+    }
 }
