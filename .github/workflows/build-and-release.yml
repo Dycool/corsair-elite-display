@@ -41,10 +41,15 @@ jobs:
         with:
           name: corsair-elite-display-windows-x64
           path: release-assets
+      - name: Create release ZIP
+        shell: pwsh
+        run: Compress-Archive -Path release-assets/corsair-elite-display.exe -DestinationPath release-assets/corsair-elite-display-windows-x64.zip -Force
       - name: Create draft release from tag
         uses: softprops/action-gh-release@v3
         with:
           draft: true
           generate_release_notes: true
-          files: release-assets/corsair-elite-display.exe
+          files: |
+            release-assets/corsair-elite-display.exe
+            release-assets/corsair-elite-display-windows-x64.zip
           fail_on_unmatched_files: true
