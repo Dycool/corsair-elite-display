@@ -20,6 +20,21 @@ fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
 
+fn remove_legacy_hardware_media_cache() {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(appdata).join("CorsairEliteDisplay");
+    // Clean up both names used during development. They are no longer read or
+    // written; OFF now returns the LCD to its own persisted hardware screen.
+    for name in ["hardware-media.cache", "hardware-image.cache"] {
+        let path = directory.join(name);
+        if path.is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -80,6 +95,8 @@ fn main() {
         }
         return;
     }
+
+    remove_legacy_hardware_media_cache();
 
     // Ensure virtual monitor is cleaned up and hardware mode restored on panic.
     std::panic::set_hook(Box::new(|_| {
